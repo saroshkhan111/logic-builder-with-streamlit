@@ -13,6 +13,23 @@ assert not at.exception, f"Initial render raised: {at.exception}"
 assert len(at.sidebar.button) == 7, f"Expected 6 step buttons + reset, got {len(at.sidebar.button)}"
 assert len(at.chat_input) == 1, "Sidebar AI tutor chat input should exist"
 
+# --- Field check buttons (🤖 Check next to Step 1 fields) ------------------
+check_keys = [b.key for b in at.button if b.label == "🤖 Check"]
+assert check_keys == ["check_title", "check_inputs", "check_outputs", "check_rules"], check_keys
+
+at.button(key="check_title").click()
+at.run()
+assert not at.exception, at.exception
+assert any(
+    "AI tutor not configured" in w.value for w in at.warning
+), [w.value for w in at.warning]  # dialog opens with graceful fallback
+at.button(key="field_check_close").click()
+at.run()
+assert not at.exception, at.exception
+assert not any(
+    "AI tutor not configured" in w.value for w in at.warning
+), "dialog should close after Close is pressed"
+
 
 def press(label: str) -> None:
     next(b for b in at.button if b.label == label).click()
@@ -75,6 +92,7 @@ assert at.session_state["current_step"] == 2
 # Step 3 — Algorithm Design
 at.text_area(key="pseudocode").set_value("START\n  READ n\nEND")
 at.run()
+assert at.button(key="check_pseudocode").label == "🤖 Check", "Pseudocode check button missing"
 press("Next →")
 assert at.session_state["current_step"] == 3, at.session_state["current_step"]
 

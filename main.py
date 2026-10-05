@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -220,6 +221,131 @@ def render_ai_validation(step_index: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Field-level AI checks (Step 1 fields + Step 3 pseudocode)
+# ---------------------------------------------------------------------------
+FIELD_CHECK_SYSTEM_PROMPT = (
+    "You are a reviewer inside Logic Builder, an app where learners write out a "
+    "programming problem before coding it. Validate whether the user's '{field}' "
+    "is appropriate for a programming problem: clear, specific, unambiguous and "
+    "complete enough for a beginner to implement.\n"
+    "Reply with ONLY a JSON object (no markdown fences) with exactly these keys:\n"
+    '{{"is_valid": true, "issues": ["issue one", "issue two"], '
+    '"suggestions": ["fix one", "fix two"]}}\n'
+    "Rules: is_valid may be true only when issues is empty. Write every issue and "
+    "suggestion as one short sentence in simple English, and ground it in the "
+    "given context instead of giving generic advice."
+)
+
+
+def _parse_field_check(raw: str | None) -> dict | None:
+    """Parse the model's JSON reply into the documented shape; None on failure."""
+    if not raw:
+        return None
+    text = raw.strip()
+    if text.startswith("```"):
+        text = "\n".join(
+            line for line in text.splitlines() if not line.strip().startswith("```")
+        ).strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        data = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict) or "is_valid" not in data:
+        return None
+
+    def _as_list(value) -> list:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(item) for item in value]
+        return [str(value)]
+
+    return {
+        "is_valid": bool(data.get("is_valid")),
+        "issues": _as_list(data.get("issues")),
+        "suggestions": _as_list(data.get("suggestions")),
+    }
+
+
+def check_field_with_ai(field_name: str, field_value: str, context_data) -> dict | None:
+    """Validate one field with Groq.
+
+    Returns {'is_valid': bool, 'issues': [...], 'suggestions': [...]} or None
+    when the API is unavailable or the reply cannot be parsed.
+    """
+    if isinstance(context_data, dict):
+        context = "\n".join(
+            f"- {name}: {str(value).strip() or '(empty)'}"
+            for name, value in context_data.items()
+        )
+    else:
+        context = str(context_data).strip()
+
+    user_message = (
+        f"Field to check: {field_name}\n"
+        f"Value:\n{field_value.strip() or '(empty)'}\n"
+        f"Context from other steps:\n{context or '(none)'}"
+    )
+    raw = ask_groq(FIELD_CHECK_SYSTEM_PROMPT.format(field=field_name), user_message)
+    return _parse_field_check(raw)
+
+
+def _problem_statement() -> dict:
+    """Step 1 data as context for other steps."""
+    state = st.session_state
+    return {
+        "Title": state.problem_title,
+        "Inputs": state.problem_inputs,
+        "Outputs": state.problem_outputs,
+        "Rules": state.problem_rules,
+    }
+
+
+def _problem_statement_without(field_name: str) -> dict:
+    """Step 1 data except the field currently being checked."""
+    return {
+        name: value
+        for name, value in _problem_statement().items()
+        if name != field_name
+    }
+
+
+@st.dialog("🤖 AI field check", width="medium")
+def show_field_check(field_name: str, result: dict | None) -> None:
+    """Modal showing the result of a field check."""
+    if result is None:
+        st.warning(AI_NOT_CONFIGURED)
+    elif result["is_valid"]:
+        st.success(
+            f"✅ {field_name} looks good — clear and suitable for a programming problem."
+        )
+        for suggestion in result["suggestions"]:
+            st.markdown(f"- 💡 {suggestion}")
+    else:
+        st.error(f"❌ {field_name} needs work.")
+        if result["issues"]:
+            st.markdown("**Issues**")
+            for issue in result["issues"]:
+                st.markdown(f"- {issue}")
+        if result["suggestions"]:
+            st.markdown("**Suggestions**")
+            for suggestion in result["suggestions"]:
+                st.markdown(f"- {suggestion}")
+    if st.button("Close", use_container_width=True, key="field_check_close"):
+        st.rerun()
+
+
+def run_field_check(field_name: str, field_value: str, context_data) -> None:
+    """Ask the AI about one field and show the result in the modal."""
+    with st.spinner(f"Checking {field_name} with AI…"):
+        result = check_field_with_ai(field_name, field_value, context_data)
+    show_field_check(field_name, result)
+
+
+# ---------------------------------------------------------------------------
 # Flowchart generator (Graphviz DOT) — --- NEW ---
 # ---------------------------------------------------------------------------
 def build_dot(pseudocode_text: str) -> str:
@@ -405,39 +531,79 @@ def step_problem_statement() -> None:
         "and the rules that connect them."
     )
 
-    st.text_input(
-        "Title",
-        key="problem_title",
-        max_chars=120,
-        placeholder="e.g. FizzBuzz — print numbers 1..n with Fizz/Buzz rules",
-    )
+    col_title, col_title_check = st.columns([6, 1], vertical_alignment="bottom")
+    with col_title:
+        st.text_input(
+            "Title",
+            key="problem_title",
+            max_chars=120,
+            persist_state="session",
+            placeholder="e.g. FizzBuzz — print numbers 1..n with Fizz/Buzz rules",
+        )
+    with col_title_check:
+        if st.button("🤖 Check", key="check_title", use_container_width=True):
+            run_field_check(
+                "Title",
+                st.session_state.problem_title,
+                _problem_statement_without("Title"),
+            )
 
     col_in, col_out = st.columns(2, gap="large")
     with col_in:
-        st.text_area(
-            "Inputs",
-            key="problem_inputs",
-            height=170,
-            placeholder="- n : int — upper bound of the range",
-        )
+        field_col, check_col = st.columns([4, 1], vertical_alignment="bottom")
+        with field_col:
+            st.text_area(
+                "Inputs",
+                key="problem_inputs",
+                height=170,
+                persist_state="session",
+                placeholder="- n : int — upper bound of the range",
+            )
+        with check_col:
+            if st.button("🤖 Check", key="check_inputs", use_container_width=True):
+                run_field_check(
+                    "Inputs",
+                    st.session_state.problem_inputs,
+                    _problem_statement_without("Inputs"),
+                )
     with col_out:
-        st.text_area(
-            "Outputs",
-            key="problem_outputs",
-            height=170,
-            placeholder="- list[str] — one result per number",
-        )
+        field_col, check_col = st.columns([4, 1], vertical_alignment="bottom")
+        with field_col:
+            st.text_area(
+                "Outputs",
+                key="problem_outputs",
+                height=170,
+                persist_state="session",
+                placeholder="- list[str] — one result per number",
+            )
+        with check_col:
+            if st.button("🤖 Check", key="check_outputs", use_container_width=True):
+                run_field_check(
+                    "Outputs",
+                    st.session_state.problem_outputs,
+                    _problem_statement_without("Outputs"),
+                )
 
-    st.text_area(
-        "Rules",
-        key="problem_rules",
-        height=170,
-        placeholder=(
-            "1. Multiples of 3 become 'Fizz'\n"
-            "2. Multiples of 5 become 'Buzz'\n"
-            "3. Multiples of both become 'FizzBuzz'"
-        ),
-    )
+    col_rules, col_rules_check = st.columns([6, 1], vertical_alignment="bottom")
+    with col_rules:
+        st.text_area(
+            "Rules",
+            key="problem_rules",
+            height=170,
+            persist_state="session",
+            placeholder=(
+                "1. Multiples of 3 become 'Fizz'\n"
+                "2. Multiples of 5 become 'Buzz'\n"
+                "3. Multiples of both become 'FizzBuzz'"
+            ),
+        )
+    with col_rules_check:
+        if st.button("🤖 Check", key="check_rules", use_container_width=True):
+            run_field_check(
+                "Rules",
+                st.session_state.problem_rules,
+                _problem_statement_without("Rules"),
+            )
 
     render_ai_validation(0)
 
@@ -481,6 +647,7 @@ def step_requirements_analysis() -> None:
             CONCEPTS,
             key="concept_selection",
             label_visibility="collapsed",
+            persist_state="session",
             placeholder="Select one or more concepts…",
         )
 
@@ -511,22 +678,32 @@ def step_algorithm_design() -> None:
     st.subheader("🧠 Algorithm Design")
     st.caption("Write your algorithm as pseudocode — plain language, one step at a time.")
 
-    st.text_area(
-        "Pseudocode",
-        key="pseudocode",
-        height=360,
-        placeholder=(
-            "START\n"
-            "  READ n\n"
-            "  FOR i FROM 1 TO n DO\n"
-            "    IF i MOD 3 = 0 AND i MOD 5 = 0 THEN PRINT \"FizzBuzz\"\n"
-            "    ELSE IF i MOD 3 = 0 THEN PRINT \"Fizz\"\n"
-            "    ELSE IF i MOD 5 = 0 THEN PRINT \"Buzz\"\n"
-            "    ELSE PRINT i\n"
-            "  END FOR\n"
-            "END"
-        ),
-    )
+    col_pseudo, col_pseudo_check = st.columns([6, 1], vertical_alignment="bottom")
+    with col_pseudo:
+        st.text_area(
+            "Pseudocode",
+            key="pseudocode",
+            height=360,
+            persist_state="session",
+            placeholder=(
+                "START\n"
+                "  READ n\n"
+                "  FOR i FROM 1 TO n DO\n"
+                "    IF i MOD 3 = 0 AND i MOD 5 = 0 THEN PRINT \"FizzBuzz\"\n"
+                "    ELSE IF i MOD 3 = 0 THEN PRINT \"Fizz\"\n"
+                "    ELSE IF i MOD 5 = 0 THEN PRINT \"Buzz\"\n"
+                "    ELSE PRINT i\n"
+                "  END FOR\n"
+                "END"
+            ),
+        )
+    with col_pseudo_check:
+        if st.button("🤖 Check", key="check_pseudocode", use_container_width=True):
+            run_field_check(
+                "Pseudocode",
+                st.session_state.pseudocode,
+                _problem_statement(),
+            )
 
     render_ai_validation(2)
 
@@ -579,6 +756,7 @@ def step_code_writing() -> None:
         "Python code",
         key="python_code",
         height=420,
+        persist_state="session",
         placeholder="def solve(...):\n    ...\n",
     )
 
@@ -637,6 +815,7 @@ def step_testing() -> None:
             "stdin (optional)",
             key="test_input",
             height=130,
+            persist_state="session",
             placeholder="Text piped to input(), one value per line…",
         )
     with col_run:
@@ -752,6 +931,7 @@ def step_optimization() -> None:
             "Your time-complexity assessment",
             COMPLEXITY_OPTIONS,
             key="opt_time_complexity",
+            persist_state="session",
             format_func=lambda value: value or "— not set —",
         )
     with col_s:
@@ -759,6 +939,7 @@ def step_optimization() -> None:
             "Your space-complexity assessment",
             COMPLEXITY_OPTIONS,
             key="opt_space_complexity",
+            persist_state="session",
             format_func=lambda value: value or "— not set —",
         )
 
@@ -766,6 +947,7 @@ def step_optimization() -> None:
         "Optimization notes",
         key="opt_notes",
         height=160,
+        persist_state="session",
         placeholder=(
             "What could be improved? e.g. "
             "\"replace the nested loop with a set lookup → O(n²) becomes O(n)\""
