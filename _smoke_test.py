@@ -1,4 +1,9 @@
 """Temporary smoke test for main.py using Streamlit's AppTest."""
+import os
+
+# Simulate Groq being unavailable (no API key) — the app must degrade gracefully.
+os.environ["GROQ_API_KEY"] = ""
+
 from streamlit.testing.v1 import AppTest
 
 at = AppTest.from_file("main.py", default_timeout=30)
@@ -6,11 +11,44 @@ at.run()
 
 assert not at.exception, f"Initial render raised: {at.exception}"
 assert len(at.sidebar.button) == 7, f"Expected 6 step buttons + reset, got {len(at.sidebar.button)}"
+assert len(at.chat_input) == 1, "Sidebar AI tutor chat input should exist"
 
 
 def press(label: str) -> None:
     next(b for b in at.button if b.label == label).click()
     at.run()
+
+
+# --- AI tutor graceful degradation (no API key) -----------------------------
+assert any(
+    "AI tutor not configured" in c.value for c in at.sidebar.caption
+), [c.value for c in at.sidebar.caption]
+
+next(b for b in at.button if b.label == "🔍 Validate with AI").click()
+at.run()
+assert not at.exception, at.exception
+assert any(
+    "AI tutor not configured" in i.value for i in at.info
+), [i.value for i in at.info]
+assert at.session_state["ai_validation"]["step"] == 0
+
+at.chat_input[0].set_value("How should I handle empty input?")
+at.run()
+assert not at.exception, at.exception
+messages = at.session_state["messages"]
+assert [m["role"] for m in messages] == ["user", "assistant"], messages
+assert messages[1]["content"] == "AI tutor not configured", messages
+
+# Validation reply must not leak into other steps
+at.text_input(key="problem_title").set_value("FizzBuzz")
+at.run()
+press("Next →")
+assert at.session_state["current_step"] == 1
+assert not any(
+    "AI tutor not configured" in i.value for i in at.info
+), "Validation reply should only show on its own step"
+press("← Back")
+assert at.session_state["current_step"] == 0
 
 
 # Step 1 — Problem Statement
@@ -99,6 +137,8 @@ assert at.session_state["python_code"] == ""
 assert at.session_state["opt_notes"] == ""
 assert at.session_state["concept_selection"] == []
 assert at.session_state["datatype_int"] is False
+assert at.session_state["messages"] == []
+assert at.session_state["ai_validation"] is None
 
 # Wizard renders fresh after reset
 assert not at.exception, at.exception
