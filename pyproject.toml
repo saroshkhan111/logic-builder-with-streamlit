@@ -1,0 +1,9 @@
+[project]
+name = "logic-builder-swith-streamlite"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "groq>=1.7.0",
+    "python-dotenv>=1.2.4",
+    "streamlit>=1.65.0",
+]
