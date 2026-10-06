@@ -288,9 +288,60 @@ def tutor_system_prompt(step_index: int | None = None) -> str:
 VALIDATION_SYSTEM_PROMPT = TEACHING_STYLE + " " + (
     "You are a meticulous requirements analyst inside Logic Builder. "
     "Find logical flaws, contradictions, ambiguities and missing edge cases in "
-    "the material for this step. Reply with short bullet points only — never "
-    "give direct solutions or full code."
+    "the material for this step. Reply with ONLY a JSON object (no markdown "
+    "fences) in this exact shape: "
+    '{"feedback":[{"field":"exact field name","mistake":"what is wrong or '
+    'unclear","solution":"the exact corrected wording or answer to use",'
+    '"reason":"why this change fixes the mistake"}]}. '
+    "Include one feedback item for every real problem in every field. "
+    "Give a specific, copy-ready correction, not a vague suggestion. "
+    "Do not invent a mistake when the field is already correct. If everything "
+    "is correct, return {\"feedback\":[]}. Keep each mistake, solution and "
+    "reason short and beginner-friendly. Do not give full solution code."
 )
+
+
+def _parse_feedback_items(
+    value: object, *, require_field: bool = False
+) -> list[dict[str, str]] | None:
+    """Validate structured mistake/solution/reason feedback from the AI."""
+    if not isinstance(value, list):
+        return None
+
+    feedback = []
+    required_keys = ["mistake", "solution", "reason"]
+    if require_field:
+        required_keys.append("field")
+
+    for item in value:
+        if not isinstance(item, dict):
+            return None
+        if any(
+            not isinstance(item.get(key), str) or not item[key].strip()
+            for key in required_keys
+        ):
+            return None
+        parsed_item = {key: item[key].strip() for key in required_keys}
+        feedback.append(parsed_item)
+    return feedback
+
+
+def _render_feedback_items(feedback: list[dict[str, str]]) -> None:
+    """Render each finding in the requested mistake, solution, reason order."""
+    for item in feedback:
+        if "field" in item:
+            st.markdown(f"**{item['field']}**")
+        st.markdown(f"**Mistake:** {item['mistake']}")
+        st.markdown(f"**Solution:** {item['solution']}")
+        st.markdown(f"**Reason:** {item['reason']}")
+
+
+def _parse_step_validation(raw: str | None) -> list[dict] | None:
+    """Parse a structured whole-step validation reply."""
+    data = _extract_json_object(raw)
+    if data is None or "feedback" not in data:
+        return None
+    return _parse_feedback_items(data["feedback"], require_field=True)
 
 
 def render_ai_validation(step_index: int) -> None:
@@ -300,12 +351,24 @@ def render_ai_validation(step_index: int) -> None:
             reply = ask_groq(VALIDATION_SYSTEM_PROMPT, wizard_user_data(step_index))
         st.session_state.ai_validation = {
             "step": step_index,
-            "reply": reply if reply else AI_NOT_CONFIGURED,
+            "reply": (
+                _parse_step_validation(reply)
+                if reply
+                else AI_NOT_CONFIGURED
+            ),
         }
 
     validation = st.session_state.ai_validation
     if validation and validation["step"] == step_index:
-        st.info(validation["reply"])
+        reply = validation["reply"]
+        if isinstance(reply, str):
+            st.info(reply)
+        elif reply is None:
+            st.error("The AI review could not be read. Please try again.")
+        elif reply:
+            _render_feedback_items(reply)
+        else:
+            st.success("No mistakes found. These fields look clear and complete.")
 
 
 # ---------------------------------------------------------------------------
@@ -318,21 +381,23 @@ FIELD_CHECK_SYSTEM_PROMPT = TEACHING_STYLE + " " + (
     "complete enough for a beginner to implement.\n"
     "Reply with ONLY a JSON object (no markdown fences) with exactly these keys:\n"
     '{{"is_valid": true/false, '
-    '"issues": ["Issue 1 in simple patient language with everyday example"], '
+    '"issues": [{{"mistake": "what is wrong or unclear", '
+    '"solution": "the exact corrected wording or answer to use", '
+    '"reason": "why this change fixes the mistake"}}], '
     '"suggestions": ["Suggestion 1 in simple words with an everyday example"]}}\n'
     "OVERRIDE for this task: the rules about saying one kind thing first and "
     "ending with encouragement do NOT apply here — the app already shows the "
     "kind opening ('Good try!') and the closing encouragement in the dialog "
-    "itself. Your issues and suggestions bullets must contain ONLY the helpful "
-    "content, written in simple words with everyday examples.\n"
+    "itself. For every issue, first identify the exact mistake, then give a "
+    "copy-ready corrected answer, then explain why it is correct. Never give "
+    "only a vague suggestion.\n"
     "Rules: is_valid may be true only when issues is empty. Ground every issue "
     "and suggestion in the given context instead of giving generic advice. "
-    "Your issues and suggestions MUST use the patient teaching style: simple "
-    "words, short sentences, and everyday examples (apples, shop, boxes). "
-    "Write only the bullet contents. Do not add greetings or closing "
+    "The solution must answer the mistake directly and should be usable as-is. "
+    "Your feedback MUST use the patient teaching style: simple words, short "
+    "sentences, and everyday examples (apples, shop, boxes). Do not add greetings or closing "
     "encouragement — the app shows those separately. "
-    "Your explanation, issues, and suggestions fields must use the patient "
-    "teaching style: simple words, short sentences, everyday examples."
+    "Keep suggestions short and optional; put every actual flaw in issues."
 )
 
 
@@ -367,11 +432,16 @@ def _as_list(value) -> list:
 def _parse_field_check(raw: str | None) -> dict | None:
     """Parse the field-check reply into the documented shape; None on failure."""
     data = _extract_json_object(raw)
-    if data is None or "is_valid" not in data:
+    if data is None or not isinstance(data.get("is_valid"), bool):
+        return None
+    issues = _parse_feedback_items(data.get("issues"))
+    if issues is None or (data["is_valid"] and issues) or (
+        not data["is_valid"] and not issues
+    ):
         return None
     return {
-        "is_valid": bool(data.get("is_valid")),
-        "issues": _as_list(data.get("issues")),
+        "is_valid": data["is_valid"],
+        "issues": issues,
         "suggestions": _as_list(data.get("suggestions")),
     }
 
@@ -379,12 +449,16 @@ def _parse_field_check(raw: str | None) -> dict | None:
 def _parse_algorithm_validation(raw: str | None) -> dict | None:
     """Parse the validate-algorithm reply into the documented shape; None on failure."""
     data = _extract_json_object(raw)
-    if data is None or "is_correct" not in data:
+    if data is None or not isinstance(data.get("is_correct"), bool):
+        return None
+    feedback = _parse_feedback_items(data.get("feedback"))
+    if feedback is None or (data["is_correct"] and feedback) or (
+        not data["is_correct"] and not feedback
+    ):
         return None
     return {
-        "is_correct": bool(data.get("is_correct")),
-        "issues": _as_list(data.get("issues")),
-        "missing_steps": _as_list(data.get("missing_steps")),
+        "is_correct": data["is_correct"],
+        "feedback": feedback,
         "explanation": str(data.get("explanation") or ""),
     }
 
@@ -446,9 +520,8 @@ def show_field_check(field_name: str, result: dict | None) -> None:
     else:
         st.error(f"🌱 Good try! Let's improve your {field_name} together.")
         if result["issues"]:
-            st.markdown("**What we can fix**")
             for issue in result["issues"]:
-                st.markdown(f"- {issue}")
+                _render_feedback_items([issue])
         if result["suggestions"]:
             st.markdown("**Friendly ideas to try**")
             for suggestion in result["suggestions"]:
@@ -477,10 +550,14 @@ SUGGESTION_SYSTEM_PROMPT = TEACHING_STYLE + " " + (
 
 ALGORITHM_VALIDATION_SYSTEM_PROMPT = TEACHING_STYLE + " " + (
     "Check whether this pseudocode correctly solves the problem. Reply with "
-    "ONLY a JSON object: {\"is_correct\": true/false, \"issues\": [...], "
-    "\"missing_steps\": [...], \"explanation\": \"...\"} "
-    "Your explanation, issues, and suggestions fields must use the patient "
-    "teaching style: simple words, short sentences, everyday examples."
+    "ONLY a JSON object (no markdown fences): "
+    "{\"is_correct\": true/false, \"feedback\": [{\"mistake\": \"what is wrong "
+    "or missing\", \"solution\": \"the exact corrected pseudocode step to use\", "
+    "\"reason\": \"why this fixes the problem\"}], \"explanation\": \"...\"}. "
+    "Include one feedback item for every real mistake. Give a specific, "
+    "copy-ready correction, not a vague suggestion. If the pseudocode is "
+    "correct, return an empty feedback list. Use simple words and short "
+    "sentences. Do not provide full solution code."
 )
 
 
@@ -519,16 +596,10 @@ def show_algorithm_validation(result: dict | None) -> None:
         st.markdown("_Nice work — trace it with one example, then move on to Code Writing._")
     else:
         st.error("❌ This pseudocode does not fully solve the problem yet.")
-        if result["issues"]:
-            st.markdown("**Issues**")
-            for issue in result["issues"]:
-                st.markdown(f"- {issue}")
-        if result["missing_steps"]:
-            st.markdown("**Missing steps**")
-            for step in result["missing_steps"]:
-                st.markdown(f"- {step}")
+        if result["feedback"]:
+            _render_feedback_items(result["feedback"])
         if result["explanation"]:
-            st.markdown(f"**Explanation:** {result['explanation']}")
+            st.markdown(f"**Overall explanation:** {result['explanation']}")
     if st.button("Close", use_container_width=True, key="algo_validation_close"):
         st.rerun()
 
