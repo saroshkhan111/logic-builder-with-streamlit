@@ -9,22 +9,92 @@ from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
+from streamlit.errors import StreamlitSecretNotFoundError
 
 # ---------------------------------------------------------------------------
 # Groq AI tutor — configuration (loaded from the .env file)
 # ---------------------------------------------------------------------------
 load_dotenv()
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# ---------------------------------------------------------------------------
+# Groq AI tutor — configuration with VALIDATION at every step
+# ---------------------------------------------------------------------------
+load_dotenv()  # Load .env file if it exists (local dev only)
+
 GROQ_MODEL = "openai/gpt-oss-120b"
 AI_NOT_CONFIGURED = "AI tutor not configured"
 
+
+def _load_groq_key() -> str | None:
+    """Load and VALIDATE the Groq API key from multiple sources.
+    
+    Priority order:
+    1. Environment variable GROQ_API_KEY (local dev via .env)
+    2. Streamlit Cloud secrets (production deployment)
+    
+    Returns:
+        Valid API key string, or None if unavailable/invalid.
+    
+    Validation steps:
+    - Key must exist
+    - Key must be a non-empty string
+    - Key must be stripped of whitespace
+    - Key must start with 'gsk_' (Groq key format)
+    """
+    # --- STEP 1: Try environment variable ---
+    key = os.getenv("GROQ_API_KEY")
+    
+    # --- STEP 2: Fall back to Streamlit secrets ---
+    if not key:
+        try:
+            key = st.secrets.get("GROQ_API_KEY")
+        except (KeyError, StreamlitSecretNotFoundError):
+            # st.secrets not available (local dev without Streamlit context)
+            key = None
+    
+    # --- STEP 3: Validate the key ---
+    if key is None:
+        return None  # No key found anywhere
+    
+    if not isinstance(key, str):
+        return None  # Key must be a string
+    
+    # Strip whitespace (common mistake in secrets.toml)
+    key = key.strip()
+    
+    if not key:
+        return None  # Empty string after strip
+    
+    # Groq keys always start with 'gsk_'
+    if not key.startswith("gsk_"):
+        return None  # Invalid format — likely a copy-paste error
+    
+    return key
+
+
+# Load the validated key (or None if unavailable)
+GROQ_API_KEY = _load_groq_key()
+
+
+# --- Import Groq SDK with validation ---
 try:
     import groq
     from groq import Groq
+    _GROQ_SDK_AVAILABLE = True
 except ImportError:  # pragma: no cover - groq SDK not installed
     groq = None
     Groq = None
+    _GROQ_SDK_AVAILABLE = False
+
+
+def is_ai_available() -> bool:
+    """Check if AI features are fully operational.
+    
+    Returns True only when:
+    - Groq SDK is installed
+    - Valid API key is loaded
+    """
+    return _GROQ_SDK_AVAILABLE and GROQ_API_KEY is not None
 
 TEACHING_STYLE = (
     "You are a very patient teacher for a complete beginner who learns slowly. "
