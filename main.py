@@ -213,7 +213,9 @@ def reset_wizard() -> None:
 # ---------------------------------------------------------------------------
 # Groq AI tutor
 # ---------------------------------------------------------------------------
-def ask_groq(system_prompt: str, user_message: str) -> str | None:
+def ask_groq(
+    system_prompt: str, user_message: str, *, temperature: float = 0.7
+) -> str | None:
     """Send one chat completion to Groq. Returns None on any failure."""
     if groq is None or Groq is None or not GROQ_API_KEY:
         return None
@@ -221,7 +223,7 @@ def ask_groq(system_prompt: str, user_message: str) -> str | None:
         client = Groq(api_key=GROQ_API_KEY)
         response = client.chat.completions.create(
             model=GROQ_MODEL,
-            temperature=0.7,
+            temperature=temperature,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
@@ -247,11 +249,15 @@ def wizard_user_data(step_index: int) -> str:
     elif step_index == IDX_REQUIREMENTS:
         selected = [d for d in DATA_TYPES if state[f"datatype_{d}"]]
         parts = [
+            f"Problem statement:\n{_problem_statement_text()}",
             f"Data types: {', '.join(selected) or 'none'}",
             f"Concepts: {', '.join(state.concept_selection) or 'none'}",
         ]
     elif step_index == IDX_ALGORITHM:
-        parts = [f"Pseudocode:\n{state.pseudocode}"]
+        parts = [
+            f"Problem statement:\n{_problem_statement_text()}",
+            f"Pseudocode:\n{state.pseudocode}",
+        ]
     elif step_index == IDX_CODE:
         parts = [f"Python code:\n{state.python_code}"]
     elif step_index == IDX_TESTING:
@@ -278,26 +284,44 @@ def tutor_system_prompt(step_index: int | None = None) -> str:
     index = st.session_state.current_step if step_index is None else step_index
     step = f"{index + 1}. {STEPS[index]}"
     data = wizard_user_data(index)
-    return TEACHING_STYLE + " " + (
-        "You are a Socratic programming tutor for Logic Builder. "
-        "Never give direct answers; guide step-by-step. "
+    return (
+        "You are a patient beginner programming tutor in Logic Builder. "
+        "Always explain in easy Roman Urdu (Urdu written using English letters). "
+        "Guide the learner spoon-feed style in short numbered key points: tell "
+        "them exactly which box to fill first, what to write next, and why each "
+        "step is needed. If a step is wrong, politely say what is wrong in "
+        "Roman Urdu, show the exact corrected wording/code in English, then "
+        "explain the reason in Roman Urdu. Accept any correct equivalent; do "
+        "not call a valid answer wrong just because it differs from your "
+        "preferred wording. Do not repeat a point already correct. If needed "
+        "information cannot be inferred, ask one short question instead of "
+        "guessing. Keep the answer concise, with at most 4 key points. "
         f"Current step: {step}. User data: {data}"
     )
 
 
 VALIDATION_SYSTEM_PROMPT = TEACHING_STYLE + " " + (
     "You are a meticulous requirements analyst inside Logic Builder. "
-    "Find logical flaws, contradictions, ambiguities and missing edge cases in "
+    "Understand the whole problem before reviewing any field. Find logical "
+    "flaws, contradictions, ambiguities and missing required information in "
     "the material for this step. Reply with ONLY a JSON object (no markdown "
-    "fences) in this exact shape: "
-    '{"feedback":[{"field":"exact field name","mistake":"what is wrong or '
-    'unclear","solution":"the exact corrected wording or answer to use",'
-    '"reason":"why this change fixes the mistake"}]}. '
-    "Include one feedback item for every real problem in every field. "
-    "Give a specific, copy-ready correction, not a vague suggestion. "
-    "Do not invent a mistake when the field is already correct. If everything "
-    "is correct, return {\"feedback\":[]}. Keep each mistake, solution and "
-    "reason short and beginner-friendly. Do not give full solution code."
+    "fences) in this shape: "
+    '{"feedback":[{"field":"exact box name","mistake_roman_urdu":"short '
+    'description of the mistake","solution_english":"exact corrected text or '
+    'step to enter in that box","reason_roman_urdu":"why this step is needed"}]}. '
+    "Explain mistakes and reasons in simple Roman Urdu (English letters only). "
+    "Write only the exact replacement text/code in English in solution_english. "
+    "Review each box against the entire problem and identify the required "
+    "inputs and rules from the task; never assume a fixed number of inputs. "
+    "Only report a missing item when it is truly required by this problem. "
+    "Accept correct equivalent wording and approaches. Never mark a valid "
+    "field wrong because optional detail or your preferred phrasing is absent. "
+    "Do not repeat issues in fields that are already correct. Order feedback "
+    "as small steps the learner can apply, and give the reason for each. If a "
+    "requirement cannot be inferred, add clarification_roman_urdu with one "
+    "brief question and omit solution_english instead of inventing an answer. "
+    "If there are no real issues, return "
+    "{\"feedback\":[]}. Be concise and do not give full solution code."
 )
 
 
@@ -309,7 +333,7 @@ def _parse_feedback_items(
         return None
 
     feedback = []
-    required_keys = ["mistake", "solution", "reason"]
+    required_keys = ["mistake_roman_urdu", "reason_roman_urdu"]
     if require_field:
         required_keys.append("field")
 
@@ -321,19 +345,38 @@ def _parse_feedback_items(
             for key in required_keys
         ):
             return None
+        has_solution = isinstance(item.get("solution_english"), str) and bool(
+            item["solution_english"].strip()
+        )
+        has_question = isinstance(
+            item.get("clarification_roman_urdu"), str
+        ) and bool(item["clarification_roman_urdu"].strip())
+        if has_solution == has_question:
+            return None
         parsed_item = {key: item[key].strip() for key in required_keys}
+        response_key = (
+            "solution_english" if has_solution else "clarification_roman_urdu"
+        )
+        parsed_item[response_key] = item[response_key].strip()
         feedback.append(parsed_item)
     return feedback
 
 
 def _render_feedback_items(feedback: list[dict[str, str]]) -> None:
     """Render each finding in the requested mistake, solution, reason order."""
-    for item in feedback:
+    for index, item in enumerate(feedback, start=1):
+        st.markdown(f"**Step {index}**")
         if "field" in item:
-            st.markdown(f"**{item['field']}**")
-        st.markdown(f"**Mistake:** {item['mistake']}")
-        st.markdown(f"**Solution:** {item['solution']}")
-        st.markdown(f"**Reason:** {item['reason']}")
+            st.markdown(f"**Box:** {item['field']}")
+        st.markdown(f"**Masla:** {item['mistake_roman_urdu']}")
+        if "solution_english" in item:
+            st.markdown("**Is tarah likhein (English):**")
+            st.code(item["solution_english"], language="text")
+        else:
+            st.markdown(
+                f"**Pehle yeh batayein:** {item['clarification_roman_urdu']}"
+            )
+        st.markdown(f"**Yeh kyun zaroori hai:** {item['reason_roman_urdu']}")
 
 
 def _parse_step_validation(raw: str | None) -> list[dict] | None:
@@ -348,7 +391,11 @@ def render_ai_validation(step_index: int) -> None:
     """'🔍 Validate with AI' button + result (Steps 1-3)."""
     if st.button("🔍 Validate with AI", key=f"validate_ai_{step_index}"):
         with st.spinner("Asking the AI reviewer…"):
-            reply = ask_groq(VALIDATION_SYSTEM_PROMPT, wizard_user_data(step_index))
+            reply = ask_groq(
+                VALIDATION_SYSTEM_PROMPT,
+                wizard_user_data(step_index),
+                temperature=0.2,
+            )
         st.session_state.ai_validation = {
             "step": step_index,
             "reply": (
@@ -364,11 +411,11 @@ def render_ai_validation(step_index: int) -> None:
         if isinstance(reply, str):
             st.info(reply)
         elif reply is None:
-            st.error("The AI review could not be read. Please try again.")
+            st.error("AI ka review samajh nahi aya. Dobara koshish karein.")
         elif reply:
             _render_feedback_items(reply)
         else:
-            st.success("No mistakes found. These fields look clear and complete.")
+            st.success("Koi zaroori ghalti nahi mili. Yeh fields theek lag rahe hain.")
 
 
 # ---------------------------------------------------------------------------
@@ -379,25 +426,31 @@ FIELD_CHECK_SYSTEM_PROMPT = TEACHING_STYLE + " " + (
     "programming problem before coding it. Validate whether the user's '{field}' "
     "is appropriate for a programming problem: clear, specific, unambiguous and "
     "complete enough for a beginner to implement.\n"
-    "Reply with ONLY a JSON object (no markdown fences) with exactly these keys:\n"
+    "Reply with ONLY a JSON object (no markdown fences) with these top-level keys:\n"
     '{{"is_valid": true/false, '
-    '"issues": [{{"mistake": "what is wrong or unclear", '
-    '"solution": "the exact corrected wording or answer to use", '
-    '"reason": "why this change fixes the mistake"}}], '
-    '"suggestions": ["Suggestion 1 in simple words with an everyday example"]}}\n'
-    "OVERRIDE for this task: the rules about saying one kind thing first and "
-    "ending with encouragement do NOT apply here — the app already shows the "
-    "kind opening ('Good try!') and the closing encouragement in the dialog "
-    "itself. For every issue, first identify the exact mistake, then give a "
-    "copy-ready corrected answer, then explain why it is correct. Never give "
-    "only a vague suggestion.\n"
-    "Rules: is_valid may be true only when issues is empty. Ground every issue "
-    "and suggestion in the given context instead of giving generic advice. "
-    "The solution must answer the mistake directly and should be usable as-is. "
-    "Your feedback MUST use the patient teaching style: simple words, short "
-    "sentences, and everyday examples (apples, shop, boxes). Do not add greetings or closing "
-    "encouragement — the app shows those separately. "
-    "Keep suggestions short and optional; put every actual flaw in issues."
+    '"issues": [{{"mistake_roman_urdu": "what is wrong, in easy Roman Urdu", '
+    '"solution_english": "the exact corrected text to enter, in English", '
+    '"reason_roman_urdu": "why this step is needed, in easy Roman Urdu"}}], '
+    '"suggestions": ["Optional short tip in Roman Urdu"]}}\n'
+    "Use the complete problem context to understand what this exact task needs. "
+    "For an Inputs box, derive the required input values from the problem, "
+    "state how many distinct values are needed only when the task makes that "
+    "clear, and identify which ones are missing. Never assume every problem "
+    "has the same inputs. Check only the requested box; do not blame this box "
+    "for content that belongs in another box. Preserve parts that are already "
+    "correct and give ordered, small corrections for actual mistakes only. "
+    "Treat equivalent correct wording or valid approaches as correct; do not "
+    "demand optional detail. If the task does not provide enough information "
+    "to decide, add clarification_roman_urdu with one short question in Roman "
+    "Urdu and omit solution_english rather than guessing. Every issue must "
+    "have mistake_roman_urdu and reason_roman_urdu plus exactly one of "
+    "solution_english or clarification_roman_urdu. Explain the mistake and "
+    "reason in easy Roman Urdu. Put only copy-ready corrected text in English "
+    "in solution_english. Keep feedback "
+    "short and specific. is_valid must be true exactly when issues is empty. "
+    "Write optional suggestions in Roman Urdu and omit generic or unnecessary "
+    "suggestions. "
+    "Do not add greetings or closing encouragement; the app shows those."
 )
 
 
@@ -482,7 +535,11 @@ def check_field_with_ai(field_name: str, field_value: str, context_data) -> dict
         f"Value:\n{field_value.strip() or '(empty)'}\n"
         f"Context from other steps:\n{context or '(none)'}"
     )
-    raw = ask_groq(FIELD_CHECK_SYSTEM_PROMPT.format(field=field_name), user_message)
+    raw = ask_groq(
+        FIELD_CHECK_SYSTEM_PROMPT.format(field=field_name),
+        user_message,
+        temperature=0.2,
+    )
     return _parse_field_check(raw)
 
 
@@ -512,21 +569,20 @@ def show_field_check(field_name: str, result: dict | None) -> None:
     if result is None:
         st.warning(AI_NOT_CONFIGURED)
     elif result["is_valid"]:
-        st.success(f"🌟 Well done! Your {field_name} looks great!")
+        st.success(f"🌟 Shabash! Is problem ke liye {field_name} theek hai.")
         if result["suggestions"]:
-            st.markdown("**Bonus ideas**")
+            st.markdown("**Chhoti si optional tip**")
             for suggestion in result["suggestions"]:
                 st.markdown(f"- 💡 {suggestion}")
     else:
-        st.error(f"🌱 Good try! Let's improve your {field_name} together.")
+        st.error(f"🌱 Achhi koshish! {field_name} ko mil kar theek karte hain.")
         if result["issues"]:
-            for issue in result["issues"]:
-                _render_feedback_items([issue])
+            _render_feedback_items(result["issues"])
         if result["suggestions"]:
-            st.markdown("**Friendly ideas to try**")
+            st.markdown("**Agla chhota mashwara**")
             for suggestion in result["suggestions"]:
                 st.markdown(f"- {suggestion}")
-        st.caption("You are learning — every try makes you stronger! 💪")
+        st.caption("Har koshish se aap behtar seekh rahe hain! 💪")
     if st.button("Close", use_container_width=True, key="field_check_close"):
         st.rerun()
 
@@ -549,15 +605,23 @@ SUGGESTION_SYSTEM_PROMPT = TEACHING_STYLE + " " + (
 )
 
 ALGORITHM_VALIDATION_SYSTEM_PROMPT = TEACHING_STYLE + " " + (
-    "Check whether this pseudocode correctly solves the problem. Reply with "
-    "ONLY a JSON object (no markdown fences): "
-    "{\"is_correct\": true/false, \"feedback\": [{\"mistake\": \"what is wrong "
-    "or missing\", \"solution\": \"the exact corrected pseudocode step to use\", "
-    "\"reason\": \"why this fixes the problem\"}], \"explanation\": \"...\"}. "
-    "Include one feedback item for every real mistake. Give a specific, "
-    "copy-ready correction, not a vague suggestion. If the pseudocode is "
-    "correct, return an empty feedback list. Use simple words and short "
-    "sentences. Do not provide full solution code."
+    "Understand the problem statement and required inputs before checking the "
+    "pseudocode. Reply with ONLY a JSON object (no markdown fences): "
+    "{\"is_correct\": true/false, \"feedback\": [{\"mistake_roman_urdu\": "
+    "\"what is wrong or missing, in easy Roman Urdu\", \"solution_english\": "
+    "\"the exact corrected pseudocode step in English\", \"reason_roman_urdu\": "
+    "\"why this step is needed, in easy Roman Urdu\"}], \"explanation\": "
+    "\"short overall explanation in Roman Urdu\"}. "
+    "Check each pseudocode step against the actual task; do not assume a fixed "
+    "number of inputs. Accept valid equivalent steps, and do not report correct "
+    "steps again. For each real issue, say what is wrong and give the exact "
+    "replacement/additional pseudocode step in English plus its reason in "
+    "Roman Urdu. Put the most important correction first. If a needed detail "
+    "cannot be inferred, add clarification_roman_urdu with one short question "
+    "and omit solution_english instead of guessing. Each issue must have "
+    "mistake_roman_urdu and reason_roman_urdu plus exactly one of "
+    "solution_english or clarification_roman_urdu. If the pseudocode is "
+    "correct, return an empty feedback list."
 )
 
 
@@ -590,16 +654,16 @@ def show_algorithm_validation(result: dict | None) -> None:
     if result is None:
         st.warning(AI_NOT_CONFIGURED)
     elif result["is_correct"]:
-        st.success("✅ Your pseudocode correctly solves the problem.")
+        st.success("✅ Aapka pseudocode problem ko sahi tarah solve karta hai.")
         if result["explanation"]:
             st.markdown(result["explanation"])
-        st.markdown("_Nice work — trace it with one example, then move on to Code Writing._")
+        st.markdown("_Shabash — ab ek example ke saath check karein, phir Code Writing par jayein._")
     else:
-        st.error("❌ This pseudocode does not fully solve the problem yet.")
+        st.error("❌ Yeh pseudocode abhi problem ko poori tarah solve nahi karta.")
         if result["feedback"]:
             _render_feedback_items(result["feedback"])
         if result["explanation"]:
-            st.markdown(f"**Overall explanation:** {result['explanation']}")
+            st.markdown(f"**Mukhtasar wajah:** {result['explanation']}")
     if st.button("Close", use_container_width=True, key="algo_validation_close"):
         st.rerun()
 
@@ -972,6 +1036,7 @@ def step_algorithm_design() -> None:
                 reply = ask_groq(
                     ALGORITHM_VALIDATION_SYSTEM_PROMPT,
                     _algorithm_validation_message(),
+                    temperature=0.2,
                 )
             show_algorithm_validation(_parse_algorithm_validation(reply))
 
@@ -1419,6 +1484,12 @@ def urdu_helper_system_prompt() -> str:
         "clearly when the learner did not understand something, but do not "
         "write the full solution code for their problem. Use everyday "
         "examples (seb ginna, dukaan se saman kharidna, moze chhantna). "
+        "When correcting their work, explain the mistake and reason in Roman "
+        "Urdu, but show the exact corrected wording or pseudocode in English. "
+        "Guide them in short numbered steps: which box to fill first, what to "
+        "write next, and why. Accept valid equivalent answers and do not repeat "
+        "correct steps. If required information is unknown, ask one short "
+        "question instead of guessing. Use at most 4 key points. "
         "The learner may write in Roman Urdu, Urdu or English; always answer "
         f"in Roman Urdu. Current step: {step}. Learner data: {data}"
     )
