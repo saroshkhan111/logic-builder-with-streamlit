@@ -93,6 +93,43 @@ assert at.session_state["current_step"] == 2
 at.text_area(key="pseudocode").set_value("START\n  READ n\nEND")
 at.run()
 assert at.button(key="check_pseudocode").label == "🤖 Check", "Pseudocode check button missing"
+
+# --- Step 3 Copilot-style AI assistant (graceful degradation, no API key) ---
+at.button(key="get_ai_suggestion").click()
+at.run()
+assert not at.exception, at.exception
+assert any(
+    "AI tutor not configured" in w.value for w in at.warning
+), [w.value for w in at.warning]
+assert at.session_state["ai_suggestion"] is None, "no suggestion should be stored on failure"
+
+# Copy to Editor: inject a suggestion and verify it lands in the editor
+at.session_state["ai_suggestion"] = "INPUT n\nPRINT n * 2"
+at.run()
+assert at.button(key="copy_ai_suggestion").label == "📋 Copy to Editor"
+at.button(key="copy_ai_suggestion").click()
+at.run()
+assert not at.exception, at.exception
+assert at.session_state["pseudocode"] == "INPUT n\nPRINT n * 2"
+assert at.session_state["ai_suggestion"] == "INPUT n\nPRINT n * 2"
+
+# ✓ Validate Algorithm → dialog fallback + close
+at.button(key="validate_algorithm").click()
+at.run()
+assert not at.exception, at.exception
+assert any(
+    "AI tutor not configured" in w.value for w in at.warning
+), [w.value for w in at.warning]
+at.button(key="algo_validation_close").click()
+at.run()
+assert not at.exception, at.exception
+assert not any(
+    "AI tutor not configured" in w.value for w in at.warning
+), "validate dialog should close"
+
+# Restore the canonical pseudocode for later assertions
+at.text_area(key="pseudocode").set_value("START\n  READ n\nEND")
+at.run()
 press("Next →")
 assert at.session_state["current_step"] == 3, at.session_state["current_step"]
 
@@ -157,6 +194,7 @@ assert at.session_state["concept_selection"] == []
 assert at.session_state["datatype_int"] is False
 assert at.session_state["messages"] == []
 assert at.session_state["ai_validation"] is None
+assert at.session_state["ai_suggestion"] is None
 
 # Wizard renders fresh after reset
 assert not at.exception, at.exception

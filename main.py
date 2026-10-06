@@ -1,5 +1,7 @@
 import json
+import keyword
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -23,6 +25,19 @@ try:
 except ImportError:  # pragma: no cover - groq SDK not installed
     groq = None
     Groq = None
+
+TEACHING_STYLE = (
+    "You are a very patient teacher for a complete beginner who learns slowly. "
+    "Follow these rules strictly: "
+    "(1) Use very simple words and short sentences. "
+    "(2) One idea per sentence. "
+    "(3) Explain every technical word in brackets, e.g. 'loop (repeat the same steps again and again)'. "
+    "(4) Use everyday examples like counting apples, buying things at a shop, or sorting socks. "
+    "(5) NEVER say 'this is easy' or 'obviously' or 'simply' — it makes the learner feel bad. "
+    "(6) If the learner is wrong, first say one kind thing like 'Good try!' or 'You are thinking well!', then gently explain what to fix. "
+    "(7) Keep answers short: 3 to 6 bullet points maximum. "
+    "(8) End with one small encouraging sentence like 'You are doing great!' or 'Keep going, you will get it!'."
+)
 
 # ---------------------------------------------------------------------------
 # Page configuration
@@ -101,7 +116,10 @@ WIZARD_DEFAULTS: dict = {
     "opt_notes": "",
     # AI tutor
     "messages": [],
+    "urdu_messages": [],
     "ai_validation": None,
+    "ai_suggestion": None,
+    "suggested_filename": "",
 }
 
 
@@ -190,14 +208,14 @@ def tutor_system_prompt(step_index: int | None = None) -> str:
     index = st.session_state.current_step if step_index is None else step_index
     step = f"{index + 1}. {STEPS[index]}"
     data = wizard_user_data(index)
-    return (
+    return TEACHING_STYLE + " " + (
         "You are a Socratic programming tutor for Logic Builder. "
         "Never give direct answers; guide step-by-step. "
         f"Current step: {step}. User data: {data}"
     )
 
 
-VALIDATION_SYSTEM_PROMPT = (
+VALIDATION_SYSTEM_PROMPT = TEACHING_STYLE + " " + (
     "You are a meticulous requirements analyst inside Logic Builder. "
     "Find logical flaws, contradictions, ambiguities and missing edge cases in "
     "the material for this step. Reply with short bullet points only — never "
@@ -223,22 +241,33 @@ def render_ai_validation(step_index: int) -> None:
 # ---------------------------------------------------------------------------
 # Field-level AI checks (Step 1 fields + Step 3 pseudocode)
 # ---------------------------------------------------------------------------
-FIELD_CHECK_SYSTEM_PROMPT = (
+FIELD_CHECK_SYSTEM_PROMPT = TEACHING_STYLE + " " + (
     "You are a reviewer inside Logic Builder, an app where learners write out a "
     "programming problem before coding it. Validate whether the user's '{field}' "
     "is appropriate for a programming problem: clear, specific, unambiguous and "
     "complete enough for a beginner to implement.\n"
     "Reply with ONLY a JSON object (no markdown fences) with exactly these keys:\n"
-    '{{"is_valid": true, "issues": ["issue one", "issue two"], '
-    '"suggestions": ["fix one", "fix two"]}}\n'
-    "Rules: is_valid may be true only when issues is empty. Write every issue and "
-    "suggestion as one short sentence in simple English, and ground it in the "
-    "given context instead of giving generic advice."
+    '{{"is_valid": true/false, '
+    '"issues": ["Issue 1 in simple patient language with everyday example"], '
+    '"suggestions": ["Suggestion 1 in simple words with an everyday example"]}}\n'
+    "OVERRIDE for this task: the rules about saying one kind thing first and "
+    "ending with encouragement do NOT apply here — the app already shows the "
+    "kind opening ('Good try!') and the closing encouragement in the dialog "
+    "itself. Your issues and suggestions bullets must contain ONLY the helpful "
+    "content, written in simple words with everyday examples.\n"
+    "Rules: is_valid may be true only when issues is empty. Ground every issue "
+    "and suggestion in the given context instead of giving generic advice. "
+    "Your issues and suggestions MUST use the patient teaching style: simple "
+    "words, short sentences, and everyday examples (apples, shop, boxes). "
+    "Write only the bullet contents. Do not add greetings or closing "
+    "encouragement — the app shows those separately. "
+    "Your explanation, issues, and suggestions fields must use the patient "
+    "teaching style: simple words, short sentences, everyday examples."
 )
 
 
-def _parse_field_check(raw: str | None) -> dict | None:
-    """Parse the model's JSON reply into the documented shape; None on failure."""
+def _extract_json_object(raw: str | None) -> dict | None:
+    """Strip markdown fences, extract the JSON object and parse it; None on failure."""
     if not raw:
         return None
     text = raw.strip()
@@ -253,20 +282,40 @@ def _parse_field_check(raw: str | None) -> dict | None:
         data = json.loads(text[start : end + 1])
     except json.JSONDecodeError:
         return None
-    if not isinstance(data, dict) or "is_valid" not in data:
+    return data if isinstance(data, dict) else None
+
+
+def _as_list(value) -> list:
+    """Coerce a JSON value into a list of strings."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    return [str(value)]
+
+
+def _parse_field_check(raw: str | None) -> dict | None:
+    """Parse the field-check reply into the documented shape; None on failure."""
+    data = _extract_json_object(raw)
+    if data is None or "is_valid" not in data:
         return None
-
-    def _as_list(value) -> list:
-        if value is None:
-            return []
-        if isinstance(value, list):
-            return [str(item) for item in value]
-        return [str(value)]
-
     return {
         "is_valid": bool(data.get("is_valid")),
         "issues": _as_list(data.get("issues")),
         "suggestions": _as_list(data.get("suggestions")),
+    }
+
+
+def _parse_algorithm_validation(raw: str | None) -> dict | None:
+    """Parse the validate-algorithm reply into the documented shape; None on failure."""
+    data = _extract_json_object(raw)
+    if data is None or "is_correct" not in data:
+        return None
+    return {
+        "is_correct": bool(data.get("is_correct")),
+        "issues": _as_list(data.get("issues")),
+        "missing_steps": _as_list(data.get("missing_steps")),
+        "explanation": str(data.get("explanation") or ""),
     }
 
 
@@ -319,21 +368,22 @@ def show_field_check(field_name: str, result: dict | None) -> None:
     if result is None:
         st.warning(AI_NOT_CONFIGURED)
     elif result["is_valid"]:
-        st.success(
-            f"✅ {field_name} looks good — clear and suitable for a programming problem."
-        )
-        for suggestion in result["suggestions"]:
-            st.markdown(f"- 💡 {suggestion}")
+        st.success(f"🌟 Well done! Your {field_name} looks great!")
+        if result["suggestions"]:
+            st.markdown("**Bonus ideas**")
+            for suggestion in result["suggestions"]:
+                st.markdown(f"- 💡 {suggestion}")
     else:
-        st.error(f"❌ {field_name} needs work.")
+        st.error(f"🌱 Good try! Let's improve your {field_name} together.")
         if result["issues"]:
-            st.markdown("**Issues**")
+            st.markdown("**What we can fix**")
             for issue in result["issues"]:
                 st.markdown(f"- {issue}")
         if result["suggestions"]:
-            st.markdown("**Suggestions**")
+            st.markdown("**Friendly ideas to try**")
             for suggestion in result["suggestions"]:
                 st.markdown(f"- {suggestion}")
+        st.caption("You are learning — every try makes you stronger! 💪")
     if st.button("Close", use_container_width=True, key="field_check_close"):
         st.rerun()
 
@@ -343,6 +393,74 @@ def run_field_check(field_name: str, field_value: str, context_data) -> None:
     with st.spinner(f"Checking {field_name} with AI…"):
         result = check_field_with_ai(field_name, field_value, context_data)
     show_field_check(field_name, result)
+
+
+# ---------------------------------------------------------------------------
+# Step 3 Copilot-style AI assistant (suggestion + validation)
+# ---------------------------------------------------------------------------
+SUGGESTION_SYSTEM_PROMPT = TEACHING_STYLE + " " + (
+    "You are a pseudocode tutor. Generate clear step-by-step pseudocode that "
+    "solves this exact problem. Use UPPERCASE keywords (INPUT, SET, FOR, IF, "
+    "ELSE, PRINT). One action per line. Reply with ONLY the pseudocode lines, "
+    "no explanations."
+)
+
+ALGORITHM_VALIDATION_SYSTEM_PROMPT = TEACHING_STYLE + " " + (
+    "Check whether this pseudocode correctly solves the problem. Reply with "
+    "ONLY a JSON object: {\"is_correct\": true/false, \"issues\": [...], "
+    "\"missing_steps\": [...], \"explanation\": \"...\"} "
+    "Your explanation, issues, and suggestions fields must use the patient "
+    "teaching style: simple words, short sentences, everyday examples."
+)
+
+
+def _problem_statement_text() -> str:
+    """Step 1 problem statement as plain text for AI prompts."""
+    return "\n".join(
+        f"{name}: {str(value).strip() or '(empty)'}"
+        for name, value in _problem_statement().items()
+    )
+
+
+def _algorithm_validation_message() -> str:
+    """Problem statement + the user's current pseudocode for the validate prompt."""
+    return (
+        f"Problem statement:\n{_problem_statement_text()}\n\n"
+        f"Pseudocode to check:\n{st.session_state.pseudocode.strip() or '(empty)'}"
+    )
+
+
+def _copy_ai_suggestion_to_editor() -> None:
+    """on_click callback — runs before widgets are instantiated, so it may
+    legally write to the widget-bound 'pseudocode' key."""
+    if st.session_state.ai_suggestion:
+        st.session_state.pseudocode = st.session_state.ai_suggestion
+
+
+@st.dialog("✓ Validate algorithm", width="medium")
+def show_algorithm_validation(result: dict | None) -> None:
+    """Modal showing the result of '✓ Validate Algorithm'."""
+    if result is None:
+        st.warning(AI_NOT_CONFIGURED)
+    elif result["is_correct"]:
+        st.success("✅ Your pseudocode correctly solves the problem.")
+        if result["explanation"]:
+            st.markdown(result["explanation"])
+        st.markdown("_Nice work — trace it with one example, then move on to Code Writing._")
+    else:
+        st.error("❌ This pseudocode does not fully solve the problem yet.")
+        if result["issues"]:
+            st.markdown("**Issues**")
+            for issue in result["issues"]:
+                st.markdown(f"- {issue}")
+        if result["missing_steps"]:
+            st.markdown("**Missing steps**")
+            for step in result["missing_steps"]:
+                st.markdown(f"- {step}")
+        if result["explanation"]:
+            st.markdown(f"**Explanation:** {result['explanation']}")
+    if st.button("Close", use_container_width=True, key="algo_validation_close"):
+        st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -678,7 +796,9 @@ def step_algorithm_design() -> None:
     st.subheader("🧠 Algorithm Design")
     st.caption("Write your algorithm as pseudocode — plain language, one step at a time.")
 
-    col_pseudo, col_pseudo_check = st.columns([6, 1], vertical_alignment="bottom")
+    col_pseudo, col_check, col_validate = st.columns(
+        [6, 1, 1], vertical_alignment="bottom"
+    )
     with col_pseudo:
         st.text_area(
             "Pseudocode",
@@ -697,13 +817,45 @@ def step_algorithm_design() -> None:
                 "END"
             ),
         )
-    with col_pseudo_check:
+    with col_check:
         if st.button("🤖 Check", key="check_pseudocode", use_container_width=True):
             run_field_check(
                 "Pseudocode",
                 st.session_state.pseudocode,
                 _problem_statement(),
             )
+    with col_validate:
+        if st.button("✓ Validate Algorithm", key="validate_algorithm",
+                     use_container_width=True):
+            with st.spinner("Checking your pseudocode…"):
+                reply = ask_groq(
+                    ALGORITHM_VALIDATION_SYSTEM_PROMPT,
+                    _algorithm_validation_message(),
+                )
+            show_algorithm_validation(_parse_algorithm_validation(reply))
+
+    # 💡 Get AI Suggestion — below the pseudocode textarea
+    if st.button("💡 Get AI Suggestion", key="get_ai_suggestion"):
+        with st.spinner("Drafting pseudocode with AI…"):
+            suggestion = ask_groq(SUGGESTION_SYSTEM_PROMPT, _problem_statement_text())
+        if suggestion and suggestion.strip():
+            st.session_state.ai_suggestion = suggestion.strip()
+        else:
+            st.session_state.ai_suggestion = None
+            st.warning(AI_NOT_CONFIGURED)
+
+    if st.session_state.ai_suggestion:
+        st.info(
+            "💡 **AI suggestion** — paste-ready pseudocode:\n\n"
+            f"```\n{st.session_state.ai_suggestion}\n```"
+        )
+        if st.button(
+            "📋 Copy to Editor",
+            key="copy_ai_suggestion",
+            use_container_width=True,
+            on_click=_copy_ai_suggestion_to_editor,
+        ):
+            st.rerun()
 
     render_ai_validation(2)
 
@@ -728,6 +880,53 @@ def step_algorithm_design() -> None:
             st.warning("Could not generate flowchart from the given pseudocode.")
     else:
         st.info("Sketch your algorithm here — a rough outline is enough to continue.")
+
+
+# ---------------------------------------------------------------------------
+# Step 4 helper — PEP 8 file name suggestion
+# ---------------------------------------------------------------------------
+FILENAME_SYSTEM_PROMPT = (
+    "You name Python files. Given a programming problem, reply with ONLY one "
+    "file name in PEP 8 style: lowercase snake_case, 2 to 4 words, descriptive "
+    "of the problem, ending in .py (for example: reverse_string.py). No quotes, "
+    "no explanation."
+)
+_FILENAME_STOPWORDS = {
+    "a", "an", "the", "of", "to", "in", "for", "and", "or", "with", "from",
+    "write", "program", "that", "find", "given", "using", "by", "is", "are",
+}
+_MAX_FILENAME_STEM = 40
+
+
+def sanitize_filename(raw: str | None, fallback_text: str = "") -> str:
+    """Turn a raw name into a PEP 8 module file name (snake_case, ends in .py)."""
+    candidate = (raw or "").strip().splitlines()[0] if (raw or "").strip() else ""
+    candidate = candidate.strip(" `'\"")
+    if candidate.lower().endswith(".py"):
+        candidate = candidate[:-3]
+    stem = re.sub(r"[^a-z0-9]+", "_", candidate.lower()).strip("_")
+
+    if not stem:
+        words = [
+            w for w in re.findall(r"[a-z0-9]+", fallback_text.lower())
+            if w not in _FILENAME_STOPWORDS
+        ]
+        stem = "_".join(words[:4])
+
+    stem = stem[:_MAX_FILENAME_STEM].rstrip("_") or "solution"
+    if stem[0].isdigit():
+        stem = f"problem_{stem}"
+    # Avoid names that would shadow keywords or standard-library modules.
+    if keyword.iskeyword(stem) or stem in sys.stdlib_module_names:
+        stem = f"{stem}_solution"
+    return f"{stem}.py"
+
+
+def suggest_filename() -> str:
+    """Ask the AI for a file name; fall back to one built from the title."""
+    title = st.session_state.problem_title
+    raw = ask_groq(FILENAME_SYSTEM_PROMPT, _problem_statement_text())
+    return sanitize_filename(raw, title)
 
 
 # ---------------------------------------------------------------------------
@@ -765,6 +964,23 @@ def step_code_writing() -> None:
         st.caption(f"📝 {line_count} line(s) written — continue to Testing to run it.")
     else:
         st.info("Write your Python solution (or insert the starter template) to continue.")
+
+    if st.button("🏷️ Suggest file name", key="suggest_filename"):
+        with st.spinner("Choosing a good file name…"):
+            st.session_state.suggested_filename = suggest_filename()
+
+    if st.session_state.suggested_filename:
+        name = st.session_state.suggested_filename
+        st.caption("PEP 8 file name (lowercase, words joined by underscores):")
+        st.code(name, language="text")
+        st.download_button(
+            f"⬇️ Download {name}",
+            data=st.session_state.python_code,
+            file_name=name,
+            mime="text/x-python",
+            key="download_code",
+            disabled=not st.session_state.python_code.strip(),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1043,11 +1259,143 @@ def render_summary() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Roman Urdu helper chatbot — explains anything the learner did not understand
+# ---------------------------------------------------------------------------
+URDU_HELPER_HISTORY_TURNS = 6
+
+
+def urdu_helper_system_prompt() -> str:
+    """Patient Roman Urdu teacher prompt, aware of the current wizard step."""
+    index = st.session_state.current_step
+    step = f"{index + 1}. {STEPS[index]}"
+    data = wizard_user_data(index)
+    return TEACHING_STYLE + " " + (
+        "OVERRIDE for this task: you are a patient helper inside Logic Builder "
+        "and you must reply in very easy Roman Urdu (Urdu written in English "
+        "letters, like 'Yeh loop baar baar kaam dohrata hai'). Keep programming "
+        "words in English, but explain each one in Roman Urdu in brackets. "
+        "Unlike a Socratic tutor, you MAY explain the idea directly and "
+        "clearly when the learner did not understand something, but do not "
+        "write the full solution code for their problem. Use everyday "
+        "examples (seb ginna, dukaan se saman kharidna, moze chhantna). "
+        "The learner may write in Roman Urdu, Urdu or English; always answer "
+        f"in Roman Urdu. Current step: {step}. Learner data: {data}"
+    )
+
+
+def _urdu_helper_message(question: str) -> str:
+    """Question plus a few recent turns, since ask_groq takes a single message."""
+    recent = st.session_state.urdu_messages[-URDU_HELPER_HISTORY_TURNS:]
+    history = "\n".join(
+        f"{'Learner' if m['role'] == 'user' else 'Teacher'}: {m['content']}"
+        for m in recent
+    )
+    if not history:
+        return question
+    return f"Earlier conversation:\n{history}\n\nLearner's new question: {question}"
+
+
+def render_urdu_helper() -> None:
+    """Expander with a Roman Urdu Q&A chat for anything the learner is stuck on."""
+    with st.expander("🧑‍🏫 Samajh nahi aya? Roman Urdu mein poochein"):
+        if not GROQ_API_KEY:
+            st.caption(f"⚠️ {AI_NOT_CONFIGURED}")
+        st.caption(
+            "Koi bhi baat, AI ka jawab ya step samajh na aye to yahan likhein. "
+            "Teacher aasan Roman Urdu mein samjhayega."
+        )
+
+        for message in st.session_state.urdu_messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+
+        with st.form("urdu_helper_form", clear_on_submit=True):
+            question = st.text_area(
+                "Apna sawal likhein",
+                key="urdu_helper_question",
+                height=90,
+                placeholder="Misal: loop kya hota hai? Ya: AI ne jo kaha wo samajh nahi aya…",
+            )
+            asked = st.form_submit_button("Samjhao 🙏", use_container_width=True)
+
+        if asked and question.strip():
+            question = question.strip()
+            with st.spinner("Teacher soch raha hai…"):
+                reply = ask_groq(
+                    urdu_helper_system_prompt(), _urdu_helper_message(question)
+                )
+            st.session_state.urdu_messages.append({"role": "user", "content": question})
+            st.session_state.urdu_messages.append(
+                {"role": "assistant", "content": reply if reply else AI_NOT_CONFIGURED}
+            )
+            st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Previous steps recap — shown at the top of every step after the first
+# ---------------------------------------------------------------------------
+def _recap_text(value: str) -> str:
+    return value.strip() if value and value.strip() else "_(not filled)_"
+
+
+def _render_step_recap(index: int) -> None:
+    """Read-only summary of what the learner entered in one earlier step."""
+    state = st.session_state
+    if index == IDX_PROBLEM:
+        st.markdown(f"**Title:** {_recap_text(state.problem_title)}")
+        st.markdown(f"**Inputs:** {_recap_text(state.problem_inputs)}")
+        st.markdown(f"**Outputs:** {_recap_text(state.problem_outputs)}")
+        st.markdown(f"**Rules:** {_recap_text(state.problem_rules)}")
+    elif index == IDX_REQUIREMENTS:
+        selected = [d for d in DATA_TYPES if state[f"datatype_{d}"]]
+        st.markdown(f"**Data types:** {', '.join(selected) or '_(none selected)_'}")
+        st.markdown(
+            f"**Concepts:** {', '.join(state.concept_selection) or '_(none selected)_'}"
+        )
+    elif index == IDX_ALGORITHM:
+        if state.pseudocode.strip():
+            st.code(state.pseudocode, language="text")
+        else:
+            st.markdown("_(not filled)_")
+    elif index == IDX_CODE:
+        if state.python_code.strip():
+            st.code(state.python_code, language="python")
+        else:
+            st.markdown("_(not filled)_")
+    elif index == IDX_TESTING:
+        if state.test_ran:
+            st.markdown(f"**Exit code:** {state.test_returncode}")
+            if state.test_output:
+                st.markdown("**Output:**")
+                st.code(state.test_output, language="text")
+            if state.test_error:
+                st.markdown("**Errors:**")
+                st.code(state.test_error, language="text")
+        else:
+            st.markdown("_(the code has not been run yet)_")
+
+
+def render_previous_steps() -> None:
+    """Clearly visible panel with the work from every earlier step."""
+    current = st.session_state.current_step
+    if current == 0:
+        return
+    with st.container(border=True):
+        st.markdown("### 📚 Your work so far")
+        st.caption("Look back at your earlier steps while you work on this one.")
+        tabs = st.tabs([f"{i + 1}. {STEPS[i]}" for i in range(current)])
+        for index, tab in enumerate(tabs):
+            with tab:
+                _render_step_recap(index)
+
+
+# ---------------------------------------------------------------------------
 # Main area
 # ---------------------------------------------------------------------------
 def render_main() -> None:
     if st.session_state.finished:
         render_summary()
+        render_urdu_helper()
         return
 
     step_index = st.session_state.current_step
@@ -1055,8 +1403,10 @@ def render_main() -> None:
     st.caption(f"Step {step_index + 1} of {len(STEPS)} · Logic Builder wizard")
     st.divider()
 
+    render_previous_steps()
     STEP_RENDERERS[step_index]()
     render_navigation()
+    render_urdu_helper()
 
 
 # ---------------------------------------------------------------------------
