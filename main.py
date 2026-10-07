@@ -172,7 +172,10 @@ WIZARD_DEFAULTS: dict = {
     "inputs_quiz": None,
     "outputs_quiz": None,
     "rules_quiz": None,
+    "test_quiz": None,
     "quiz_serial": 0,
+    "requirements_recommendation": None,
+    "optimization_recommendation": None,
     # Step 2 — Requirements Analysis
     **{f"datatype_{dtype}": False for dtype in DATA_TYPES},
     "concept_selection": [],
@@ -181,6 +184,9 @@ WIZARD_DEFAULTS: dict = {
     "algorithm_line_review": None,
     # Step 4 — Code Writing
     "python_code": "",
+    "code_line_suggestion": None,
+    "code_line_review": None,
+    "expected_test_output": "",
     # Step 5 — Testing
     "test_input": "",
     "test_output": "",
@@ -503,14 +509,12 @@ def _parse_title_suggestions(raw: str | None) -> list[str] | None:
     return titles or None
 
 
-def _parse_field_quiz(raw: str | None) -> dict | None:
+def _parse_field_quiz(
+    raw: str | None, *, require_expected_output: bool = False
+) -> dict | None:
     """Validate generated multiple-choice questions before showing them."""
     data = _extract_json_object(raw)
-    if (
-        data is None
-        or not isinstance(data.get("questions"), list)
-        or len(data["questions"]) > 5
-    ):
+    if data is None or not isinstance(data.get("questions"), list):
         return None
 
     questions = []
@@ -521,11 +525,12 @@ def _parse_field_quiz(raw: str | None) -> dict | None:
         options = item.get("options")
         correct_option = item.get("correct_option")
         reason = item.get("reason_roman_urdu")
+        expected_output = item.get("expected_output")
         if (
             not isinstance(question, str)
             or not question.strip()
             or not isinstance(options, list)
-            or not 3 <= len(options) <= 4
+            or not 2 <= len(options) <= 4
             or any(
                 not isinstance(option, str)
                 or not option.strip()
@@ -539,6 +544,20 @@ def _parse_field_quiz(raw: str | None) -> dict | None:
             or correct_option.strip() not in {option.strip() for option in options}
             or not isinstance(reason, str)
             or not reason.strip()
+            or (
+                require_expected_output
+                and (
+                    not isinstance(expected_output, str)
+                    or len(expected_output) > 1000
+                )
+            )
+            or (
+                expected_output is not None
+                and (
+                    not isinstance(expected_output, str)
+                    or len(expected_output) > 1000
+                )
+            )
         ):
             return None
         questions.append(
@@ -547,6 +566,7 @@ def _parse_field_quiz(raw: str | None) -> dict | None:
                 "options": [option.strip()[:240] for option in options],
                 "correct_option": correct_option.strip()[:240],
                 "reason_roman_urdu": reason.strip()[:500],
+                "expected_output": expected_output,
             }
         )
 
@@ -574,23 +594,36 @@ def _field_quiz_prompt(field_name: str) -> str:
             "Test the task's actual conditions, transformations, and edge cases. "
             "Do not invent rules not stated or implied by the problem."
         ),
+        "Test cases": (
+            "Create only the distinct test inputs essential to verify the "
+            "specified behavior, including a boundary only when the statement "
+            "requires it. Each correct option must be one valid stdin input "
+            "line for the current code. Do not invent a required sample or "
+            "combine separate executions into one test input."
+        ),
     }
     return (
         "You are creating a beginner multiple-choice quiz for the "
         f"{field_name} box in a programming problem-solving app. "
         f"{field_guidance[field_name]} Read the complete problem context and "
-        "the box's current content. Make one question per distinct required "
-        "fact that is not already correctly present. Return 1 to 5 questions; "
-        "if all required facts are already covered or the problem gives no "
+        "the box's current content. Determine how many distinct facts or "
+        "cases are strictly required by this specific problem and not already "
+        "correctly present. Return exactly one question per such missing item: "
+        "do not use a fixed question count, do not cap the list at an arbitrary "
+        "number, and do not add optional or speculative questions. If all "
+        "required items are already covered or the problem gives no "
         "reliable answer, return an empty questions list and put a brief "
         "clarifying question in clarification_roman_urdu when appropriate. "
-        "Each question must have exactly 4 distinct, plausible options, with "
+        "Each question must have 2 to 4 distinct, plausible options, with "
         "exactly one correct_option that exactly matches one option. The "
         "correct option must be a concise, copy-ready line suitable for adding "
-        "to the box. Give a brief reason in easy Roman Urdu. Never guess missing "
+        "to the box. For Test cases, include expected_output as the exact expected "
+        "stdout for the correct stdin option. Give a brief reason in easy Roman "
+        "Urdu. Never guess missing "
         "requirements or repeat facts already in the box. Reply only with JSON "
         'in this shape: {"questions":[{"question":"...","options":["...","...",'
-        '"...","..."],"correct_option":"...","reason_roman_urdu":"..."}],'
+        '"...","..."],"correct_option":"...","reason_roman_urdu":"...",'
+        '"expected_output":"..."}],'
         '"clarification_roman_urdu":""}.'
     )
 
@@ -615,6 +648,13 @@ def _start_field_quiz(field_name: str, field_key: str, quiz_key: str) -> None:
         f"Outputs: {st.session_state.problem_outputs.strip() or '(empty)'}\n"
         f"Rules: {st.session_state.problem_rules.strip() or '(empty)'}"
     )
+    if field_name == "Test cases":
+        context += (
+            f"\n\nPseudocode:\n{st.session_state.pseudocode.strip() or '(empty)'}"
+            f"\n\nPython code:\n{st.session_state.python_code.strip() or '(empty)'}"
+            f"\n\nExisting test input:\n"
+            f"{st.session_state.test_input.strip() or '(empty)'}"
+        )
     with st.spinner(f"Preparing the {field_name.lower()} quiz…"):
         reply = ask_groq(
             _field_quiz_prompt(field_name),
@@ -622,7 +662,11 @@ def _start_field_quiz(field_name: str, field_key: str, quiz_key: str) -> None:
             temperature=0.2,
         )
 
-    quiz = _parse_field_quiz(reply) if reply else None
+    quiz = (
+        _parse_field_quiz(reply, require_expected_output=field_name == "Test cases")
+        if reply
+        else None
+    )
     if quiz is None:
         st.session_state[quiz_key] = {
             "questions": [],
@@ -639,31 +683,80 @@ def _start_field_quiz(field_name: str, field_key: str, quiz_key: str) -> None:
     st.session_state[quiz_key] = quiz
 
 
-def _append_quiz_answer(field_key: str, answer: str) -> None:
+def _append_quiz_answer(field_key: str, answer: str) -> bool:
     """Append a correct answer to its box without duplicating an existing line."""
     current = st.session_state[field_key].strip()
     if answer.casefold() not in {line.strip().casefold() for line in current.splitlines()}:
         st.session_state[field_key] = f"{current}\n{answer}".strip()
+        return True
+    return False
 
 
-def _submit_field_quiz_answer(field_key: str, quiz_key: str) -> None:
-    """Grade the selected option and add only correct answers to the field."""
+def _submit_field_quiz_answer(
+    field_key: str, quiz_key: str, expected_quiz_id: int, expected_index: int
+) -> None:
+    """Grade an answer only if the callback still matches its current question."""
     quiz = st.session_state[quiz_key]
-    index = quiz["index"]
-    question = quiz["questions"][index]
-    radio_key = f"field_quiz_answer_{quiz['id']}_{index}"
+    if not isinstance(quiz, dict):
+        return
+    index = quiz.get("index")
+    questions = quiz.get("questions")
+    if (
+        quiz.get("id") != expected_quiz_id
+        or index != expected_index
+        or not isinstance(index, int)
+        or isinstance(index, bool)
+        or not isinstance(questions, list)
+        or index < 0
+        or index >= len(questions)
+        or not isinstance(questions[index], dict)
+    ):
+        return
+    question = questions[index]
+    radio_key = f"field_quiz_answer_{expected_quiz_id}_{index}"
     selected = st.session_state.get(radio_key)
     is_correct = selected == question["correct_option"]
-    quiz["result"] = {"is_correct": is_correct}
+    updated_quiz = dict(quiz)
+    updated_quiz["result"] = {"is_correct": is_correct}
+    st.session_state[quiz_key] = updated_quiz
     if is_correct:
-        _append_quiz_answer(field_key, question["correct_option"])
+        added = _append_quiz_answer(field_key, question["correct_option"])
+        if added and question.get("expected_output") is not None:
+            current_output = st.session_state.expected_test_output
+            expected_output = question["expected_output"]
+            if current_output:
+                st.session_state.expected_test_output = (
+                    f"{current_output.rstrip(chr(10))}\n{expected_output}"
+                )
+            else:
+                st.session_state.expected_test_output = expected_output
 
 
-def _advance_field_quiz(quiz_key: str) -> None:
-    """Move to the next generated quiz question."""
+def _advance_field_quiz(
+    quiz_key: str, expected_quiz_id: int, expected_index: int
+) -> None:
+    """Move forward only if the callback still refers to the active quiz question."""
     quiz = st.session_state[quiz_key]
-    quiz["index"] += 1
-    quiz["result"] = None
+    if not isinstance(quiz, dict):
+        return
+    questions = quiz.get("questions")
+    index = quiz.get("index")
+    if (
+        quiz.get("id") != expected_quiz_id
+        or index != expected_index
+        or not isinstance(index, int)
+        or isinstance(index, bool)
+        or not isinstance(questions, list)
+        or index < 0
+        or index + 1 >= len(questions)
+        or not isinstance(quiz.get("result"), dict)
+    ):
+        return
+
+    next_quiz = dict(quiz)
+    next_quiz["index"] = index + 1
+    next_quiz["result"] = None
+    st.session_state[quiz_key] = next_quiz
 
 
 def _clear_field_quiz(quiz_key: str) -> None:
@@ -680,7 +773,7 @@ def render_field_quiz(field_name: str, field_key: str, quiz_key: str) -> None:
         _start_field_quiz(field_name, field_key, quiz_key)
 
     quiz = st.session_state[quiz_key]
-    if not quiz:
+    if not isinstance(quiz, dict):
         return
 
     if quiz.get("error"):
@@ -699,7 +792,17 @@ def render_field_quiz(field_name: str, field_key: str, quiz_key: str) -> None:
             st.success("Is box ke liye koi nayi maloomat baqi nahi.")
         return
 
-    index = quiz["index"]
+    index = quiz.get("index")
+    if (
+        not isinstance(index, int)
+        or isinstance(index, bool)
+        or index < 0
+        or index >= len(questions)
+        or not isinstance(quiz.get("id"), int)
+    ):
+        st.session_state[quiz_key] = None
+        st.warning("Quiz state reset ho gaya. Dobara quiz shuru karein.")
+        return
     question = questions[index]
     st.markdown(f"**Quiz {index + 1}/{len(questions)}:** {question['question']}")
     if quiz["result"] is None:
@@ -712,7 +815,7 @@ def render_field_quiz(field_name: str, field_key: str, quiz_key: str) -> None:
             "Check answer",
             key=f"submit_field_quiz_{quiz['id']}_{index}",
             on_click=_submit_field_quiz_answer,
-            args=(field_key, quiz_key),
+            args=(field_key, quiz_key, quiz["id"], index),
         )
         return
 
@@ -727,7 +830,7 @@ def render_field_quiz(field_name: str, field_key: str, quiz_key: str) -> None:
             "Agla sawal",
             key=f"next_field_quiz_{quiz['id']}_{index}",
             on_click=_advance_field_quiz,
-            args=(quiz_key,),
+            args=(quiz_key, quiz["id"], index),
         )
     else:
         st.success("Quiz mukammal ho gaya.")
@@ -736,15 +839,181 @@ def render_field_quiz(field_name: str, field_key: str, quiz_key: str) -> None:
 def _clear_title_suggestions() -> None:
     """Discard title suggestions when their source statement changes."""
     st.session_state.title_suggestions = []
-    for quiz_key in ("inputs_quiz", "outputs_quiz", "rules_quiz"):
+    for quiz_key in ("inputs_quiz", "outputs_quiz", "rules_quiz", "test_quiz"):
         st.session_state[quiz_key] = None
     st.session_state.ai_suggestion = None
     st.session_state.algorithm_line_review = None
+    st.session_state.code_line_suggestion = None
+    st.session_state.code_line_review = None
+    st.session_state.requirements_recommendation = None
+    st.session_state.optimization_recommendation = None
 
 
 def _use_title_suggestion(title: str) -> None:
     """Copy a clicked suggestion into the title widget before it is rendered."""
     st.session_state.problem_title = title
+
+
+def _requirements_prompt() -> str:
+    """Ask AI for only the data types and concepts this problem actually needs."""
+    allowed_types = ", ".join(DATA_TYPES)
+    allowed_concepts = ", ".join(CONCEPTS)
+    return (
+        "Analyze this programming problem for a beginner requirements profile. "
+        "Return exactly the necessary data types and programming concepts, "
+        "without optional or merely possible choices. Use only the exact "
+        f"allowed data type names: {allowed_types}. Use only the exact "
+        f"allowed concept names: {allowed_concepts}. If a detail is not "
+        "required by the problem, omit it. Give a short reason in Roman Urdu. "
+        "Return only JSON with keys data_types, concepts, reason_roman_urdu. "
+        "The first two values must be arrays of exact allowed names."
+    )
+
+
+def _parse_requirements(raw: str | None) -> dict | None:
+    data = _extract_json_object(raw)
+    if (
+        data is None
+        or not isinstance(data.get("data_types"), list)
+        or not isinstance(data.get("concepts"), list)
+        or not isinstance(data.get("reason_roman_urdu"), str)
+        or not data["reason_roman_urdu"].strip()
+        or any(value not in DATA_TYPES for value in data["data_types"])
+        or any(value not in CONCEPTS for value in data["concepts"])
+        or len(set(data["data_types"])) != len(data["data_types"])
+        or len(set(data["concepts"])) != len(data["concepts"])
+    ):
+        return None
+    return {
+        "data_types": data["data_types"],
+        "concepts": data["concepts"],
+        "reason_roman_urdu": data["reason_roman_urdu"].strip()[:500],
+    }
+
+
+def _suggest_requirements() -> None:
+    """Apply only the AI-selected requirements before their widgets render."""
+    description = _problem_statement_text()
+    if not st.session_state.problem_description.strip():
+        st.session_state.requirements_recommendation = {
+            "error": "Pehle Step 1 mein problem statement paste karein."
+        }
+        return
+
+    with st.spinner("Selecting only the required concepts and data types…"):
+        reply = ask_groq(_requirements_prompt(), description, temperature=0.2)
+    recommendation = _parse_requirements(reply) if reply else None
+    if not recommendation:
+        st.session_state.requirements_recommendation = {
+            "error": AI_NOT_CONFIGURED if not reply else "invalid_reply"
+        }
+        return
+
+    selected_types = set(recommendation["data_types"])
+    for data_type in DATA_TYPES:
+        st.session_state[f"datatype_{data_type}"] = data_type in selected_types
+    st.session_state.concept_selection = recommendation["concepts"]
+    st.session_state.requirements_recommendation = recommendation
+
+
+def _render_requirements_recommendation() -> None:
+    recommendation = st.session_state.requirements_recommendation
+    if not recommendation:
+        return
+    if "error" in recommendation:
+        if recommendation["error"] == AI_NOT_CONFIGURED:
+            st.warning(AI_NOT_CONFIGURED)
+        elif recommendation["error"] == "invalid_reply":
+            st.error("Requirements ka jawab samajh nahi aya. Dobara koshish karein.")
+        else:
+            st.info(recommendation["error"])
+        return
+    st.success("Sirf problem ke liye zaroori selections apply kiye gaye.")
+    st.caption(recommendation["reason_roman_urdu"])
+
+
+def _clear_requirements_recommendation() -> None:
+    st.session_state.requirements_recommendation = None
+
+
+def _optimization_prompt() -> str:
+    return (
+        "Assess the supplied solution only for this exact problem. Choose the "
+        "best justified time and auxiliary-space complexity from the allowed "
+        "values. Do not claim optimization is needed unless there is a concrete "
+        "improvement. Return an empty note if no specific improvement is "
+        "necessary. Allowed values: "
+        f"{', '.join(value for value in COMPLEXITY_OPTIONS if value)}. "
+        "Return only JSON with keys time_complexity, space_complexity, "
+        "reason_roman_urdu, optimization_note. Use exact allowed values and "
+        "write the reason in easy Roman Urdu."
+    )
+
+
+def _parse_optimization(raw: str | None) -> dict | None:
+    data = _extract_json_object(raw)
+    if (
+        data is None
+        or data.get("time_complexity") not in COMPLEXITY_OPTIONS[1:]
+        or data.get("space_complexity") not in COMPLEXITY_OPTIONS[1:]
+        or not isinstance(data.get("reason_roman_urdu"), str)
+        or not data["reason_roman_urdu"].strip()
+        or not isinstance(data.get("optimization_note"), str)
+    ):
+        return None
+    return {
+        "time_complexity": data["time_complexity"],
+        "space_complexity": data["space_complexity"],
+        "reason_roman_urdu": data["reason_roman_urdu"].strip()[:500],
+        "optimization_note": data["optimization_note"].strip()[:1000],
+    }
+
+
+def _suggest_optimization() -> None:
+    """Fill complexity choices and a problem-specific note from current code."""
+    if not st.session_state.python_code.strip():
+        st.session_state.optimization_recommendation = {
+            "error": "Pehle Step 4 mein apna Python code likhein."
+        }
+        return
+    message = (
+        f"Problem:\n{_problem_statement_text()}\n\n"
+        f"Pseudocode:\n{st.session_state.pseudocode.strip() or '(empty)'}\n\n"
+        f"Python code:\n{st.session_state.python_code.strip()}"
+    )
+    with st.spinner("Reviewing only the complexity and useful improvements…"):
+        reply = ask_groq(_optimization_prompt(), message, temperature=0.2)
+    recommendation = _parse_optimization(reply) if reply else None
+    if not recommendation:
+        st.session_state.optimization_recommendation = {
+            "error": AI_NOT_CONFIGURED if not reply else "invalid_reply"
+        }
+        return
+
+    st.session_state.opt_time_complexity = recommendation["time_complexity"]
+    st.session_state.opt_space_complexity = recommendation["space_complexity"]
+    st.session_state.opt_notes = recommendation["optimization_note"]
+    st.session_state.optimization_recommendation = recommendation
+
+
+def _render_optimization_recommendation() -> None:
+    recommendation = st.session_state.optimization_recommendation
+    if not recommendation:
+        return
+    if "error" in recommendation:
+        if recommendation["error"] == AI_NOT_CONFIGURED:
+            st.warning(AI_NOT_CONFIGURED)
+        elif recommendation["error"] == "invalid_reply":
+            st.error("Optimization review samajh nahi aya. Dobara koshish karein.")
+        else:
+            st.info(recommendation["error"])
+        return
+    st.success("Problem aur code ke mutabiq assessment apply kar di.")
+    st.caption(recommendation["reason_roman_urdu"])
+
+
+def _clear_optimization_recommendation() -> None:
+    st.session_state.optimization_recommendation = None
 
 
 def _as_list(value) -> list:
@@ -1024,6 +1293,95 @@ def _check_latest_algorithm_line() -> None:
             if result
             else {"error": "AI ka line review samajh nahi aya. Dobara koshish karein."}
         )
+
+
+CODE_LINE_SUGGESTION_PROMPT = (
+    "You are a Python tutor. From the exact task, pseudocode, and existing "
+    "Python code, suggest only the next necessary Python source line. Do not "
+    "repeat existing lines or write multiple lines. Preserve correct Python "
+    "indentation. If code is complete, return is_complete true and an empty "
+    "next_line. Give a brief Roman Urdu reason. Return only JSON with "
+    "next_line, reason_roman_urdu, is_complete."
+)
+
+CODE_LINE_CHECK_PROMPT = (
+    "Check only the latest non-empty Python source line against the exact "
+    "problem, pseudocode, and preceding code. Accept valid equivalent Python. "
+    "Reply only with JSON fields is_correct (boolean), feedback_roman_urdu, "
+    "correct_line, and reason_roman_urdu. Explain in easy Roman Urdu. If correct, "
+    "correct_line must be empty. If incorrect, provide exactly one corrected "
+    "Python line, preserving indentation. Do not rewrite other lines."
+)
+
+
+def _suggest_next_code_line() -> None:
+    """Ask for just the next Python line required by the problem."""
+    message = (
+        f"Problem:\n{_problem_statement_text()}\n\n"
+        f"Pseudocode:\n{st.session_state.pseudocode.strip() or '(empty)'}\n\n"
+        f"Current Python code:\n{st.session_state.python_code.rstrip() or '(no lines yet)'}"
+    )
+    with st.spinner("Suggesting the next required Python line…"):
+        reply = ask_groq(CODE_LINE_SUGGESTION_PROMPT, message, temperature=0.2)
+    suggestion = _parse_next_algorithm_line(reply) if reply else None
+    if suggestion:
+        st.session_state.code_line_suggestion = suggestion
+    else:
+        st.session_state.code_line_suggestion = {
+            "error": AI_NOT_CONFIGURED if not reply else "invalid_reply"
+        }
+
+
+def _append_code_suggestion() -> None:
+    """Append one suggested Python line before the code editor is rendered."""
+    suggestion = st.session_state.code_line_suggestion
+    if not isinstance(suggestion, dict) or not suggestion.get("next_line"):
+        return
+    current = st.session_state.python_code.rstrip()
+    st.session_state.python_code = (
+        f"{current}\n{suggestion['next_line']}".strip()
+    )
+    st.session_state.code_line_suggestion = None
+    st.session_state.code_line_review = None
+
+
+def _check_latest_code_line() -> None:
+    """Ask AI to check only the last entered Python line."""
+    lines = st.session_state.python_code.splitlines()
+    nonempty_indices = [index for index, line in enumerate(lines) if line.strip()]
+    if not nonempty_indices:
+        st.session_state.code_line_review = {
+            "error": "Pehle Python code ki ek line likhein."
+        }
+        return
+
+    latest_index = nonempty_indices[-1]
+    latest_line = lines[latest_index]
+    message = (
+        f"Problem:\n{_problem_statement_text()}\n\n"
+        f"Pseudocode:\n{st.session_state.pseudocode.strip() or '(empty)'}\n\n"
+        f"Previous Python lines:\n"
+        f"{chr(10).join(lines[:latest_index]).rstrip() or '(no previous lines)'}\n\n"
+        f"Latest Python line to check:\n{latest_line}"
+    )
+    with st.spinner("Checking your latest Python line…"):
+        reply = ask_groq(CODE_LINE_CHECK_PROMPT, message, temperature=0.2)
+    if not reply:
+        st.session_state.code_line_review = {"error": AI_NOT_CONFIGURED}
+        return
+    result = _parse_algorithm_line_review(reply)
+    st.session_state.code_line_review = (
+        {"line": latest_line, "result": result}
+        if result
+        else {"error": "AI ka code-line review samajh nahi aya. Dobara koshish karein."}
+    )
+
+
+def _clear_code_line_review() -> None:
+    """Clear feedback and suggestions after the code editor changes."""
+    st.session_state.code_line_suggestion = None
+    st.session_state.code_line_review = None
+    st.session_state.optimization_recommendation = None
 
 
 def _clear_algorithm_line_review() -> None:
@@ -1405,12 +1763,24 @@ def step_requirements_analysis() -> None:
         "Pick the data types your solution will use and the programming concepts it needs."
     )
 
+    st.button(
+        "🧠 Select only required items",
+        key="suggest_requirements",
+        on_click=_suggest_requirements,
+    )
+    _render_requirements_recommendation()
+
     col_types, col_concepts = st.columns(2, gap="large")
 
     with col_types:
         st.markdown("##### Data types")
         for dtype in DATA_TYPES:
-            st.checkbox(dtype, key=f"datatype_{dtype}", persist_state="session")
+            st.checkbox(
+                dtype,
+                key=f"datatype_{dtype}",
+                persist_state="session",
+                on_change=_clear_requirements_recommendation,
+            )
 
     with col_concepts:
         st.markdown("##### Concepts needed")
@@ -1420,6 +1790,7 @@ def step_requirements_analysis() -> None:
             key="concept_selection",
             label_visibility="collapsed",
             persist_state="session",
+            on_change=_clear_requirements_recommendation,
             placeholder="Select one or more concepts…",
         )
 
@@ -1653,8 +2024,57 @@ def step_code_writing() -> None:
         key="python_code",
         height=420,
         persist_state="session",
+        on_change=_clear_code_line_review,
         placeholder="def solve(...):\n    ...\n",
     )
+
+    code_actions = st.columns(2)
+    with code_actions[0]:
+        if st.button("💡 Suggest next Python line", key="suggest_next_code_line"):
+            _suggest_next_code_line()
+    with code_actions[1]:
+        st.button(
+            "✅ Check latest Python line",
+            key="check_latest_code_line",
+            on_click=_check_latest_code_line,
+        )
+
+    code_suggestion = st.session_state.code_line_suggestion
+    if code_suggestion:
+        if code_suggestion.get("error"):
+            if code_suggestion["error"] == AI_NOT_CONFIGURED:
+                st.warning(AI_NOT_CONFIGURED)
+            else:
+                st.error("Agli code line ki suggestion samajh nahi ayi. Dobara koshish karein.")
+        elif code_suggestion["is_complete"]:
+            st.success("AI ke mutabiq required Python code mukammal hai.")
+        else:
+            st.info(
+                f"**Agli required line:** `{code_suggestion['next_line']}`\n\n"
+                f"**Wajah:** {code_suggestion['reason_roman_urdu']}"
+            )
+            st.button(
+                "📋 Add suggested Python line",
+                key="append_code_suggestion",
+                on_click=_append_code_suggestion,
+            )
+
+    code_review = st.session_state.code_line_review
+    if code_review:
+        if "error" in code_review:
+            if code_review["error"] == AI_NOT_CONFIGURED:
+                st.warning(code_review["error"])
+            else:
+                st.error(code_review["error"])
+        elif code_review.get("result"):
+            result = code_review["result"]
+            if result["is_correct"]:
+                st.success("✅ Latest Python line sahi hai.")
+            else:
+                st.error(f"❌ {result['feedback_roman_urdu']}")
+                st.markdown("**Sahi line:**")
+                st.code(result["correct_line"], language="python")
+            st.markdown(f"**Wajah:** {result['reason_roman_urdu']}")
 
     if st.session_state.python_code.strip():
         line_count = len(st.session_state.python_code.splitlines())
@@ -1729,7 +2149,17 @@ def step_testing() -> None:
             key="test_input",
             height=130,
             persist_state="session",
+            on_change=_clear_field_quiz,
+            args=("test_quiz",),
             placeholder="Text piped to input(), one value per line…",
+        )
+        render_field_quiz("Test cases", "test_input", "test_quiz")
+        st.text_area(
+            "Expected output (optional)",
+            key="expected_test_output",
+            height=100,
+            persist_state="session",
+            placeholder="Expected program output for this test input…",
         )
     with col_run:
         st.write("")
@@ -1742,7 +2172,17 @@ def step_testing() -> None:
         return
 
     if st.session_state.test_returncode == 0:
-        st.success("✅ Ran successfully (exit code 0)")
+        if st.session_state.expected_test_output.strip():
+            actual = st.session_state.test_output.rstrip("\r\n")
+            expected = st.session_state.expected_test_output.rstrip("\r\n")
+            if actual == expected:
+                st.success("✅ Ran successfully and matched the expected output.")
+            else:
+                st.error("❌ Actual output does not match the expected output.")
+                st.markdown("**Expected output**")
+                st.code(st.session_state.expected_test_output, language="text")
+        else:
+            st.success("✅ Ran successfully (exit code 0)")
     else:
         st.error(f"❌ Exited with code {st.session_state.test_returncode}")
 
@@ -1815,6 +2255,13 @@ def step_optimization() -> None:
         "treat it as a conversation starter, not a measurement."
     )
 
+    st.button(
+        "🧠 Assess only the needed complexity",
+        key="suggest_optimization",
+        on_click=_suggest_optimization,
+    )
+    _render_optimization_recommendation()
+
     st.markdown("##### Big-O cheat sheet")
     st.table(
         {
@@ -1845,6 +2292,7 @@ def step_optimization() -> None:
             COMPLEXITY_OPTIONS,
             key="opt_time_complexity",
             persist_state="session",
+            on_change=_clear_optimization_recommendation,
             format_func=lambda value: value or "— not set —",
         )
     with col_s:
@@ -1853,6 +2301,7 @@ def step_optimization() -> None:
             COMPLEXITY_OPTIONS,
             key="opt_space_complexity",
             persist_state="session",
+            on_change=_clear_optimization_recommendation,
             format_func=lambda value: value or "— not set —",
         )
 
@@ -1861,6 +2310,7 @@ def step_optimization() -> None:
         key="opt_notes",
         height=160,
         persist_state="session",
+        on_change=_clear_optimization_recommendation,
         placeholder=(
             "What could be improved? e.g. "
             "\"replace the nested loop with a set lookup → O(n²) becomes O(n)\""
@@ -1892,6 +2342,8 @@ def render_summary() -> None:
 
     with st.expander("1 · Problem Statement", expanded=True):
         st.markdown(f"**{st.session_state.problem_title.strip() or '_untitled_'}**")
+        if st.session_state.problem_description.strip():
+            st.markdown(f"**Problem:** {st.session_state.problem_description.strip()}")
         st.markdown(f"- **Inputs:** {st.session_state.problem_inputs.strip() or '_none_'}")
         st.markdown(f"- **Outputs:** {st.session_state.problem_outputs.strip() or '_none_'}")
         st.markdown(f"- **Rules:** {st.session_state.problem_rules.strip() or '_none_'}")
@@ -1924,6 +2376,9 @@ def render_summary() -> None:
                 )
             if st.session_state.test_output:
                 st.code(st.session_state.test_output, language="text")
+            if st.session_state.expected_test_output.strip():
+                st.markdown("**Expected output:**")
+                st.code(st.session_state.expected_test_output, language="text")
             if st.session_state.test_error:
                 st.code(st.session_state.test_error, language="text")
         else:

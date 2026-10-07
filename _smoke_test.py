@@ -123,6 +123,11 @@ at.session_state["inputs_quiz"] = {
         "options": ["n: int", "Fizz", "FizzBuzz", "A list of words"],
         "correct_option": "n: int",
         "reason_roman_urdu": "n se range ki aakhri value maloom hoti hai.",
+    }, {
+        "question": "What is the range's lower bound?",
+        "options": ["1", "0", "n", "-1"],
+        "correct_option": "1",
+        "reason_roman_urdu": "Statement mein counting 1 se shuru hoti hai.",
     }],
 }
 at.session_state["outputs_quiz"] = {
@@ -154,6 +159,11 @@ at.button(key="submit_field_quiz_81_0").click()
 at.run()
 assert at.session_state["problem_inputs"] == "n: int"
 assert any("Isay box mein add kar diya hai" in s.value for s in at.success)
+at.button(key="next_field_quiz_81_0").click()
+at.run()
+assert at.session_state["inputs_quiz"]["index"] == 1
+assert at.session_state["inputs_quiz"]["result"] is None
+assert any("Quiz 2/2" in m.value for m in at.markdown)
 
 at.radio(key="field_quiz_answer_82_0").set_value("A discount")
 at.run()
@@ -170,15 +180,22 @@ at.run()
 assert at.session_state["problem_rules"] == "Fizz"
 
 at.text_area(key="problem_outputs").set_value("- list[str]")
+at.text_area(key="problem_inputs").set_value("n: int\nstart: 1")
 at.text_area(key="problem_rules").set_value("1. multiples of 3 -> Fizz")
 at.run()
-assert at.session_state["inputs_quiz"] is not None
+assert at.session_state["inputs_quiz"] is None
 assert at.session_state["outputs_quiz"] is None
 assert at.session_state["rules_quiz"] is None
 press("Next →")
 assert at.session_state["current_step"] == 1, at.session_state["current_step"]
 
 # Step 2 — Requirements Analysis
+at.button(key="suggest_requirements").click()
+at.run()
+assert not at.exception, at.exception
+assert any(
+    "AI tutor not configured" in w.value for w in at.warning
+), [w.value for w in at.warning]
 at.checkbox(key="datatype_int").set_value(True)
 at.checkbox(key="datatype_str").set_value(True)
 at.multiselect(key="concept_selection").set_value(["Loops (for/while)"])
@@ -256,6 +273,18 @@ code = (
 )
 at.text_area(key="python_code").set_value(code)
 at.run()
+at.button(key="suggest_next_code_line").click()
+at.run()
+assert not at.exception, at.exception
+assert any(
+    "AI tutor not configured" in w.value for w in at.warning
+), [w.value for w in at.warning]
+at.button(key="check_latest_code_line").click()
+at.run()
+assert not at.exception, at.exception
+assert any(
+    "AI tutor not configured" in w.value for w in at.warning
+), [w.value for w in at.warning]
 press("Next →")
 assert at.session_state["current_step"] == 4
 assert at.session_state["python_code"] == code, "python_code was lost when leaving Step 4!"
@@ -264,11 +293,42 @@ assert at.session_state["problem_title"] == "FizzBuzz", "problem_title was lost!
 # Step 5 — Testing: run the code with stdin
 at.text_area(key="test_input").set_value("2 3 4")
 at.run()
+at.button(key="start_test_input_quiz").click()
+at.run()
+assert not at.exception, at.exception
+assert any(
+    "AI tutor not configured" in w.value for w in at.warning
+), [w.value for w in at.warning]
 press("▶️ Run code")
 assert not at.exception, at.exception
 assert at.session_state["test_ran"] is True
 assert at.session_state["test_returncode"] == 0, at.session_state["test_error"]
 assert at.session_state["test_output"].split() == ["4", "6", "8"], at.session_state["test_output"]
+
+# Correct test-case answers fill both stdin and its expected stdout.
+at.session_state["quiz_serial"] = 91
+at.session_state["test_quiz"] = {
+    "id": 91,
+    "index": 0,
+    "result": None,
+    "questions": [{
+        "question": "Choose the required test input.",
+        "options": ["5", "Fizz", "n: int", "FizzBuzz"],
+        "correct_option": "5",
+        "reason_roman_urdu": "Is input se 5 ka output test hota hai.",
+        "expected_output": "10",
+    }],
+}
+at.run()
+at.radio(key="field_quiz_answer_91_0").set_value("5")
+at.run()
+at.button(key="submit_field_quiz_91_0").click()
+at.run()
+assert at.session_state["test_input"] == "2 3 4\n5"
+assert at.session_state["expected_test_output"] == "10"
+at.text_area(key="test_input").set_value("2 3 4")
+at.text_area(key="expected_test_output").set_value("")
+at.run()
 press("Next →")
 assert at.session_state["current_step"] == 5
 
@@ -276,6 +336,12 @@ assert at.session_state["current_step"] == 5
 labels = [m.label for m in at.metric]
 assert any("Estimated time" in label for label in labels), labels
 assert any("Estimated space" in label for label in labels), labels
+at.button(key="suggest_optimization").click()
+at.run()
+assert not at.exception, at.exception
+assert any(
+    "AI tutor not configured" in w.value for w in at.warning
+), [w.value for w in at.warning]
 at.selectbox(key="opt_time_complexity").set_value("O(n)")
 at.text_area(key="opt_notes").set_value("Use a set lookup")
 at.run()
@@ -304,6 +370,7 @@ assert at.session_state["current_step"] == 0
 assert at.session_state["problem_title"] == ""
 assert at.session_state["problem_description"] == ""
 assert at.session_state["title_suggestions"] == []
+assert at.session_state["expected_test_output"] == ""
 assert at.session_state["python_code"] == ""
 assert at.session_state["opt_notes"] == ""
 assert at.session_state["concept_selection"] == []
