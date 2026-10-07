@@ -30,6 +30,33 @@ assert not any(
     "AI tutor not configured" in w.value for w in at.warning
 ), "dialog should close after Close is pressed"
 
+# --- Problem statement title suggestions ------------------------------------
+at.text_area(key="problem_description").set_value(
+    "Given a number, determine whether it is even or odd."
+)
+at.run()
+at.button(key="suggest_problem_titles").click()
+at.run()
+assert not at.exception, at.exception
+assert any(
+    "AI tutor not configured" in w.value for w in at.warning
+), [w.value for w in at.warning]
+assert at.session_state["title_suggestions"] == []
+
+# A displayed suggestion should fill the title widget when clicked.
+at.session_state["title_suggestions"] = ["Even or Odd Number Checker"]
+at.run()
+at.button(key="use_title_suggestion_0").click()
+at.run()
+assert not at.exception, at.exception
+assert at.session_state["problem_title"] == "Even or Odd Number Checker"
+assert at.text_input(key="problem_title").value == "Even or Odd Number Checker"
+at.text_area(key="problem_description").set_value(
+    "Given a price, calculate the discount."
+)
+at.run()
+assert at.session_state["title_suggestions"] == [], "stale suggestions were retained"
+
 
 def press(label: str) -> None:
     next(b for b in at.button if b.label == label).click()
@@ -71,6 +98,7 @@ assert at.session_state["current_step"] == 0
 # Step 1 — Problem Statement
 assert at.session_state["current_step"] == 0
 at.text_input(key="problem_title").set_value("FizzBuzz")
+at.text_area(key="problem_description").set_value("")
 at.text_area(key="problem_inputs").set_value("- n: int")
 at.text_area(key="problem_outputs").set_value("- list[str]")
 at.text_area(key="problem_rules").set_value("1. multiples of 3 -> Fizz")
@@ -188,6 +216,8 @@ press("🔄 Start over")
 assert at.session_state["finished"] is False
 assert at.session_state["current_step"] == 0
 assert at.session_state["problem_title"] == ""
+assert at.session_state["problem_description"] == ""
+assert at.session_state["title_suggestions"] == []
 assert at.session_state["python_code"] == ""
 assert at.session_state["opt_notes"] == ""
 assert at.session_state["concept_selection"] == []

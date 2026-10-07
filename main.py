@@ -164,6 +164,8 @@ WIZARD_DEFAULTS: dict = {
     "finished": False,
     # Step 1 — Problem Statement
     "problem_title": "",
+    "problem_description": "",
+    "title_suggestions": [],
     "problem_inputs": "",
     "problem_outputs": "",
     "problem_rules": "",
@@ -471,6 +473,38 @@ def _extract_json_object(raw: str | None) -> dict | None:
     except json.JSONDecodeError:
         return None
     return data if isinstance(data, dict) else None
+
+
+TITLE_SUGGESTION_SYSTEM_PROMPT = (
+    "You suggest concise, clear titles for programming problems. Read the "
+    "problem statement and return exactly three distinct, specific titles "
+    "that describe the task. Keep each title under 80 characters. Reply with "
+    'ONLY a JSON object in this format: {"titles": ["Title 1", "Title 2", '
+    '"Title 3"]}. Do not include markdown or explanations.'
+)
+
+
+def _parse_title_suggestions(raw: str | None) -> list[str] | None:
+    """Parse up to three usable titles from the AI's JSON response."""
+    data = _extract_json_object(raw)
+    if data is None or not isinstance(data.get("titles"), list):
+        return None
+    titles = [
+        title.strip()[:120]
+        for title in data["titles"]
+        if isinstance(title, str) and title.strip()
+    ][:3]
+    return titles or None
+
+
+def _clear_title_suggestions() -> None:
+    """Discard title suggestions when their source statement changes."""
+    st.session_state.title_suggestions = []
+
+
+def _use_title_suggestion(title: str) -> None:
+    """Copy a clicked suggestion into the title widget before it is rendered."""
+    st.session_state.problem_title = title
 
 
 def _as_list(value) -> list:
@@ -853,6 +887,50 @@ def step_problem_statement() -> None:
         "Describe what you are solving: what goes in, what comes out, "
         "and the rules that connect them."
     )
+
+    st.text_area(
+        "Paste problem statement",
+        key="problem_description",
+        height=120,
+        persist_state="session",
+        on_change=_clear_title_suggestions,
+        placeholder=(
+            "Paste the complete problem here. For example: Given a number, "
+            "print whether it is even or odd."
+        ),
+    )
+    if st.button("✨ Suggest titles", key="suggest_problem_titles"):
+        problem_description = st.session_state.problem_description.strip()
+        if not problem_description:
+            st.warning("Paste a problem statement first.")
+            st.session_state.title_suggestions = []
+        else:
+            with st.spinner("Generating title suggestions…"):
+                reply = ask_groq(
+                    TITLE_SUGGESTION_SYSTEM_PROMPT,
+                    problem_description,
+                    temperature=0.4,
+                )
+            suggestions = _parse_title_suggestions(reply)
+            if suggestions:
+                st.session_state.title_suggestions = suggestions
+            else:
+                st.session_state.title_suggestions = []
+                if reply:
+                    st.error("Could not read the title suggestions. Please try again.")
+                else:
+                    st.warning(AI_NOT_CONFIGURED)
+
+    if st.session_state.title_suggestions:
+        st.caption("Click a suggestion to use it as your title.")
+        for index, suggestion in enumerate(st.session_state.title_suggestions):
+            st.button(
+                suggestion,
+                key=f"use_title_suggestion_{index}",
+                on_click=_use_title_suggestion,
+                args=(suggestion,),
+                width="stretch",
+            )
 
     col_title, col_title_check = st.columns([6, 1], vertical_alignment="bottom")
     with col_title:
