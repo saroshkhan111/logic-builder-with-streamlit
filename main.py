@@ -169,11 +169,16 @@ WIZARD_DEFAULTS: dict = {
     "problem_inputs": "",
     "problem_outputs": "",
     "problem_rules": "",
+    "inputs_quiz": None,
+    "outputs_quiz": None,
+    "rules_quiz": None,
+    "quiz_serial": 0,
     # Step 2 — Requirements Analysis
     **{f"datatype_{dtype}": False for dtype in DATA_TYPES},
     "concept_selection": [],
     # Step 3 — Algorithm Design
     "pseudocode": "",
+    "algorithm_line_review": None,
     # Step 4 — Code Writing
     "python_code": "",
     # Step 5 — Testing
@@ -243,6 +248,7 @@ def wizard_user_data(step_index: int) -> str:
     state = st.session_state
     if step_index == IDX_PROBLEM:
         parts = [
+            f"Problem description: {state.problem_description}",
             f"Title: {state.problem_title}",
             f"Inputs: {state.problem_inputs}",
             f"Outputs: {state.problem_outputs}",
@@ -497,9 +503,243 @@ def _parse_title_suggestions(raw: str | None) -> list[str] | None:
     return titles or None
 
 
+def _parse_field_quiz(raw: str | None) -> dict | None:
+    """Validate generated multiple-choice questions before showing them."""
+    data = _extract_json_object(raw)
+    if (
+        data is None
+        or not isinstance(data.get("questions"), list)
+        or len(data["questions"]) > 5
+    ):
+        return None
+
+    questions = []
+    for item in data["questions"]:
+        if not isinstance(item, dict):
+            return None
+        question = item.get("question")
+        options = item.get("options")
+        correct_option = item.get("correct_option")
+        reason = item.get("reason_roman_urdu")
+        if (
+            not isinstance(question, str)
+            or not question.strip()
+            or not isinstance(options, list)
+            or not 3 <= len(options) <= 4
+            or any(
+                not isinstance(option, str)
+                or not option.strip()
+                or len(option) > 240
+                or "\n" in option
+                or "\r" in option
+                for option in options
+            )
+            or len({option.strip() for option in options}) != len(options)
+            or not isinstance(correct_option, str)
+            or correct_option.strip() not in {option.strip() for option in options}
+            or not isinstance(reason, str)
+            or not reason.strip()
+        ):
+            return None
+        questions.append(
+            {
+                "question": question.strip()[:500],
+                "options": [option.strip()[:240] for option in options],
+                "correct_option": correct_option.strip()[:240],
+                "reason_roman_urdu": reason.strip()[:500],
+            }
+        )
+
+    clarification = data.get("clarification_roman_urdu", "")
+    if not isinstance(clarification, str):
+        return None
+    return {
+        "questions": questions,
+        "clarification_roman_urdu": clarification.strip()[:500],
+    }
+
+
+def _field_quiz_prompt(field_name: str) -> str:
+    """Create a field-specific prompt for questions derived from the task."""
+    field_guidance = {
+        "Inputs": (
+            "Test which values a user must provide, their type, and any relevant "
+            "constraints. Do not include values the program calculates itself."
+        ),
+        "Outputs": (
+            "Test what the program must display or return, including its format "
+            "when specified. Do not confuse output with input."
+        ),
+        "Rules": (
+            "Test the task's actual conditions, transformations, and edge cases. "
+            "Do not invent rules not stated or implied by the problem."
+        ),
+    }
+    return (
+        "You are creating a beginner multiple-choice quiz for the "
+        f"{field_name} box in a programming problem-solving app. "
+        f"{field_guidance[field_name]} Read the complete problem context and "
+        "the box's current content. Make one question per distinct required "
+        "fact that is not already correctly present. Return 1 to 5 questions; "
+        "if all required facts are already covered or the problem gives no "
+        "reliable answer, return an empty questions list and put a brief "
+        "clarifying question in clarification_roman_urdu when appropriate. "
+        "Each question must have exactly 4 distinct, plausible options, with "
+        "exactly one correct_option that exactly matches one option. The "
+        "correct option must be a concise, copy-ready line suitable for adding "
+        "to the box. Give a brief reason in easy Roman Urdu. Never guess missing "
+        "requirements or repeat facts already in the box. Reply only with JSON "
+        'in this shape: {"questions":[{"question":"...","options":["...","...",'
+        '"...","..."],"correct_option":"...","reason_roman_urdu":"..."}],'
+        '"clarification_roman_urdu":""}.'
+    )
+
+
+def _start_field_quiz(field_name: str, field_key: str, quiz_key: str) -> None:
+    """Generate a quiz from the pasted problem and current field contents."""
+    description = st.session_state.problem_description.strip()
+    if not description:
+        st.session_state[quiz_key] = {
+            "questions": [],
+            "clarification_roman_urdu": "Pehle Problem Statement box mein sawal paste karein.",
+            "index": 0,
+            "result": None,
+            "id": None,
+        }
+        return
+
+    context = (
+        f"Problem statement:\n{description}\n\n"
+        f"Problem title: {st.session_state.problem_title.strip() or '(not provided)'}\n"
+        f"Inputs: {st.session_state.problem_inputs.strip() or '(empty)'}\n"
+        f"Outputs: {st.session_state.problem_outputs.strip() or '(empty)'}\n"
+        f"Rules: {st.session_state.problem_rules.strip() or '(empty)'}"
+    )
+    with st.spinner(f"Preparing the {field_name.lower()} quiz…"):
+        reply = ask_groq(
+            _field_quiz_prompt(field_name),
+            context,
+            temperature=0.2,
+        )
+
+    quiz = _parse_field_quiz(reply) if reply else None
+    if quiz is None:
+        st.session_state[quiz_key] = {
+            "questions": [],
+            "clarification_roman_urdu": "",
+            "index": 0,
+            "result": None,
+            "id": None,
+            "error": "AI tutor not configured" if not reply else "invalid_reply",
+        }
+        return
+
+    st.session_state.quiz_serial += 1
+    quiz.update({"index": 0, "result": None, "id": st.session_state.quiz_serial})
+    st.session_state[quiz_key] = quiz
+
+
+def _append_quiz_answer(field_key: str, answer: str) -> None:
+    """Append a correct answer to its box without duplicating an existing line."""
+    current = st.session_state[field_key].strip()
+    if answer.casefold() not in {line.strip().casefold() for line in current.splitlines()}:
+        st.session_state[field_key] = f"{current}\n{answer}".strip()
+
+
+def _submit_field_quiz_answer(field_key: str, quiz_key: str) -> None:
+    """Grade the selected option and add only correct answers to the field."""
+    quiz = st.session_state[quiz_key]
+    index = quiz["index"]
+    question = quiz["questions"][index]
+    radio_key = f"field_quiz_answer_{quiz['id']}_{index}"
+    selected = st.session_state.get(radio_key)
+    is_correct = selected == question["correct_option"]
+    quiz["result"] = {"is_correct": is_correct}
+    if is_correct:
+        _append_quiz_answer(field_key, question["correct_option"])
+
+
+def _advance_field_quiz(quiz_key: str) -> None:
+    """Move to the next generated quiz question."""
+    quiz = st.session_state[quiz_key]
+    quiz["index"] += 1
+    quiz["result"] = None
+
+
+def _clear_field_quiz(quiz_key: str) -> None:
+    """Discard quiz answers when the learner manually edits the related box."""
+    st.session_state[quiz_key] = None
+
+
+def render_field_quiz(field_name: str, field_key: str, quiz_key: str) -> None:
+    """Render a multiple-choice quiz that adds only correct answers to its box."""
+    if st.button(
+        f"🧠 Start {field_name.lower()} quiz",
+        key=f"start_{field_key}_quiz",
+    ):
+        _start_field_quiz(field_name, field_key, quiz_key)
+
+    quiz = st.session_state[quiz_key]
+    if not quiz:
+        return
+
+    if quiz.get("error"):
+        if quiz["error"] == "AI tutor not configured":
+            st.warning(AI_NOT_CONFIGURED)
+        else:
+            st.error("Quiz tayar nahi ho saka. Dobara koshish karein.")
+        return
+
+    questions = quiz["questions"]
+    if not questions:
+        clarification = quiz.get("clarification_roman_urdu")
+        if clarification:
+            st.info(clarification)
+        else:
+            st.success("Is box ke liye koi nayi maloomat baqi nahi.")
+        return
+
+    index = quiz["index"]
+    question = questions[index]
+    st.markdown(f"**Quiz {index + 1}/{len(questions)}:** {question['question']}")
+    if quiz["result"] is None:
+        st.radio(
+            "Apna jawab chunein",
+            question["options"],
+            key=f"field_quiz_answer_{quiz['id']}_{index}",
+        )
+        st.button(
+            "Check answer",
+            key=f"submit_field_quiz_{quiz['id']}_{index}",
+            on_click=_submit_field_quiz_answer,
+            args=(field_key, quiz_key),
+        )
+        return
+
+    if quiz["result"]["is_correct"]:
+        st.success("Sahi jawab! Isay box mein add kar diya hai.")
+    else:
+        st.error("Yeh jawab sahi nahi hai.")
+        st.markdown(f"**Sahi jawab:** {question['correct_option']}")
+    st.markdown(f"**Wajah:** {question['reason_roman_urdu']}")
+    if index + 1 < len(questions):
+        st.button(
+            "Agla sawal",
+            key=f"next_field_quiz_{quiz['id']}_{index}",
+            on_click=_advance_field_quiz,
+            args=(quiz_key,),
+        )
+    else:
+        st.success("Quiz mukammal ho gaya.")
+
+
 def _clear_title_suggestions() -> None:
     """Discard title suggestions when their source statement changes."""
     st.session_state.title_suggestions = []
+    for quiz_key in ("inputs_quiz", "outputs_quiz", "rules_quiz"):
+        st.session_state[quiz_key] = None
+    st.session_state.ai_suggestion = None
+    st.session_state.algorithm_line_review = None
 
 
 def _use_title_suggestion(title: str) -> None:
@@ -581,6 +821,7 @@ def _problem_statement() -> dict:
     """Step 1 data as context for other steps."""
     state = st.session_state
     return {
+        "Problem description": state.problem_description,
         "Title": state.problem_title,
         "Inputs": state.problem_inputs,
         "Outputs": state.problem_outputs,
@@ -631,12 +872,31 @@ def run_field_check(field_name: str, field_value: str, context_data) -> None:
 # ---------------------------------------------------------------------------
 # Step 3 Copilot-style AI assistant (suggestion + validation)
 # ---------------------------------------------------------------------------
-SUGGESTION_SYSTEM_PROMPT = TEACHING_STYLE + " " + (
-    "You are a pseudocode tutor. Generate clear step-by-step pseudocode that "
-    "solves this exact problem. Use UPPERCASE keywords (INPUT, SET, FOR, IF, "
-    "ELSE, PRINT). One action per line. Reply with ONLY the pseudocode lines, "
-    "no explanations."
+SUGGESTION_SYSTEM_PROMPT = (
+    "You are a patient pseudocode tutor. Based on the exact problem and the "
+    "learner's existing pseudocode, suggest only the single next logical line. "
+    "Do not write multiple steps or repeat existing lines. Use clear English "
+    "and pseudocode keywords such as START, READ, SET, IF, FOR, PRINT, END. "
+    "Write a short reason in easy Roman Urdu. If the algorithm is complete, "
+    "set is_complete to true and next_line to an empty string. Reply only with "
+    'JSON: {"next_line":"one line","reason_roman_urdu":"short reason",'
+    '"is_complete":false}.'
 )
+
+ALGORITHM_LINE_CHECK_SYSTEM_PROMPT = (
+    "You are a careful pseudocode tutor. Judge only the learner's latest line "
+    "against the exact problem and the preceding lines. Accept equivalent "
+    "valid pseudocode. A line is correct only if it is relevant and follows "
+    "the preceding algorithm in a logically valid order. Return exactly one "
+    "JSON object with boolean is_correct, feedback_roman_urdu, correct_line, "
+    "and reason_roman_urdu. Write feedback and reason in easy Roman Urdu. "
+    "When the submitted line is correct, set correct_line to an empty string. "
+    "When incorrect, put one corrected pseudocode line in English in "
+    "correct_line. Do not check or rewrite the whole algorithm. Do not give "
+    "the next line when the submitted line is already correct."
+)
+
+LINE_REVIEW_SYSTEM_PROMPT = ALGORITHM_LINE_CHECK_SYSTEM_PROMPT
 
 ALGORITHM_VALIDATION_SYSTEM_PROMPT = TEACHING_STYLE + " " + (
     "Understand the problem statement and required inputs before checking the "
@@ -675,11 +935,113 @@ def _algorithm_validation_message() -> str:
     )
 
 
+def _parse_next_algorithm_line(raw: str | None) -> dict | None:
+    """Validate a single-line next-step suggestion."""
+    data = _extract_json_object(raw)
+    if (
+        data is None
+        or not isinstance(data.get("next_line"), str)
+        or not isinstance(data.get("reason_roman_urdu"), str)
+        or not data["reason_roman_urdu"].strip()
+        or not isinstance(data.get("is_complete"), bool)
+    ):
+        return None
+    line = data["next_line"].strip()
+    if (data["is_complete"] and line) or (not data["is_complete"] and not line):
+        return None
+    if "\n" in line or "\r" in line or len(line) > 240:
+        return None
+    return {
+        "next_line": line[:240],
+        "reason_roman_urdu": data["reason_roman_urdu"].strip()[:500],
+        "is_complete": data["is_complete"],
+    }
+
+
+def _parse_algorithm_line_review(raw: str | None) -> dict | None:
+    """Validate feedback for one submitted pseudocode line."""
+    data = _extract_json_object(raw)
+    if (
+        data is None
+        or not isinstance(data.get("is_correct"), bool)
+        or not isinstance(data.get("feedback_roman_urdu"), str)
+        or not isinstance(data.get("correct_line"), str)
+        or not isinstance(data.get("reason_roman_urdu"), str)
+    ):
+        return None
+    feedback = data["feedback_roman_urdu"].strip()
+    correct_line = data["correct_line"].strip()
+    reason = data["reason_roman_urdu"].strip()
+    if not feedback or not reason:
+        return None
+    if data["is_correct"] and correct_line:
+        return None
+    if not data["is_correct"] and (
+        not correct_line
+        or "\n" in correct_line
+        or "\r" in correct_line
+        or len(correct_line) > 240
+    ):
+        return None
+    return {
+        "is_correct": data["is_correct"],
+        "feedback_roman_urdu": feedback[:500],
+        "correct_line": correct_line[:240],
+        "reason_roman_urdu": reason[:500],
+    }
+
+
+def _check_latest_algorithm_line() -> None:
+    """Ask AI to check only the most recently entered non-empty line."""
+    lines = st.session_state.pseudocode.splitlines()
+    nonempty_indices = [index for index, line in enumerate(lines) if line.strip()]
+    if not nonempty_indices:
+        st.session_state.algorithm_line_review = {
+            "error": "Pehle algorithm ki ek line likhein."
+        }
+        return
+
+    latest_index = nonempty_indices[-1]
+    latest_line = lines[latest_index].strip()
+    previous_lines = "\n".join(lines[:latest_index]).strip() or "(no previous lines)"
+    message = (
+        f"Problem statement:\n{_problem_statement_text()}\n\n"
+        f"Previous pseudocode lines:\n{previous_lines}\n\n"
+        f"Latest line to check:\n{latest_line}"
+    )
+    with st.spinner("Checking your latest line…"):
+        reply = ask_groq(
+            ALGORITHM_LINE_CHECK_SYSTEM_PROMPT,
+            message,
+            temperature=0.2,
+        )
+    if not reply:
+        st.session_state.algorithm_line_review = {"error": AI_NOT_CONFIGURED}
+    else:
+        result = _parse_algorithm_line_review(reply)
+        st.session_state.algorithm_line_review = (
+            {"line": latest_line, "result": result}
+            if result
+            else {"error": "AI ka line review samajh nahi aya. Dobara koshish karein."}
+        )
+
+
+def _clear_algorithm_line_review() -> None:
+    """Clear stale feedback and suggestions as the learner edits their pseudocode."""
+    st.session_state.algorithm_line_review = None
+    st.session_state.ai_suggestion = None
+
+
 def _copy_ai_suggestion_to_editor() -> None:
-    """on_click callback — runs before widgets are instantiated, so it may
-    legally write to the widget-bound 'pseudocode' key."""
-    if st.session_state.ai_suggestion:
-        st.session_state.pseudocode = st.session_state.ai_suggestion
+    """Append the suggested single line before the pseudocode widget is rendered."""
+    suggestion = st.session_state.ai_suggestion
+    if isinstance(suggestion, dict) and suggestion.get("next_line"):
+        current = st.session_state.pseudocode.rstrip()
+        st.session_state.pseudocode = (
+            f"{current}\n{suggestion['next_line']}".strip()
+        )
+        st.session_state.ai_suggestion = None
+        st.session_state.algorithm_line_review = None
 
 
 @st.dialog("✓ Validate algorithm", width="medium")
@@ -958,8 +1320,11 @@ def step_problem_statement() -> None:
                 key="problem_inputs",
                 height=170,
                 persist_state="session",
+                on_change=_clear_field_quiz,
+                args=("inputs_quiz",),
                 placeholder="- n : int — upper bound of the range",
             )
+            render_field_quiz("Inputs", "problem_inputs", "inputs_quiz")
         with check_col:
             if st.button("🤖 Check", key="check_inputs", use_container_width=True):
                 run_field_check(
@@ -975,8 +1340,11 @@ def step_problem_statement() -> None:
                 key="problem_outputs",
                 height=170,
                 persist_state="session",
+                on_change=_clear_field_quiz,
+                args=("outputs_quiz",),
                 placeholder="- list[str] — one result per number",
             )
+            render_field_quiz("Outputs", "problem_outputs", "outputs_quiz")
         with check_col:
             if st.button("🤖 Check", key="check_outputs", use_container_width=True):
                 run_field_check(
@@ -992,12 +1360,15 @@ def step_problem_statement() -> None:
             key="problem_rules",
             height=170,
             persist_state="session",
+            on_change=_clear_field_quiz,
+            args=("rules_quiz",),
             placeholder=(
                 "1. Multiples of 3 become 'Fizz'\n"
                 "2. Multiples of 5 become 'Buzz'\n"
                 "3. Multiples of both become 'FizzBuzz'"
             ),
         )
+        render_field_quiz("Rules", "problem_rules", "rules_quiz")
     with col_rules_check:
         if st.button("🤖 Check", key="check_rules", use_container_width=True):
             run_field_check(
@@ -1088,6 +1459,7 @@ def step_algorithm_design() -> None:
             key="pseudocode",
             height=360,
             persist_state="session",
+            on_change=_clear_algorithm_line_review,
             placeholder=(
                 "START\n"
                 "  READ n\n"
@@ -1118,28 +1490,69 @@ def step_algorithm_design() -> None:
                 )
             show_algorithm_validation(_parse_algorithm_validation(reply))
 
-    # 💡 Get AI Suggestion — below the pseudocode textarea
-    if st.button("💡 Get AI Suggestion", key="get_ai_suggestion"):
-        with st.spinner("Drafting pseudocode with AI…"):
-            suggestion = ask_groq(SUGGESTION_SYSTEM_PROMPT, _problem_statement_text())
-        if suggestion and suggestion.strip():
-            st.session_state.ai_suggestion = suggestion.strip()
+    col_next_line, col_check_line = st.columns(2)
+    with col_next_line:
+        if st.button("💡 Suggest next line", key="get_ai_suggestion"):
+            message = (
+                f"Problem statement:\n{_problem_statement_text()}\n\n"
+                f"Current pseudocode:\n"
+                f"{st.session_state.pseudocode.strip() or '(no lines yet)'}"
+            )
+            with st.spinner("Thinking of the next step…"):
+                reply = ask_groq(
+                    SUGGESTION_SYSTEM_PROMPT,
+                    message,
+                    temperature=0.3,
+                )
+            suggestion = _parse_next_algorithm_line(reply) if reply else None
+            if suggestion:
+                st.session_state.ai_suggestion = suggestion
+            else:
+                st.session_state.ai_suggestion = None
+                if reply:
+                    st.error("AI ki next-line suggestion samajh nahi ayi. Dobara koshish karein.")
+                else:
+                    st.warning(AI_NOT_CONFIGURED)
+    with col_check_line:
+        st.button(
+            "✅ Check latest line",
+            key="check_latest_algorithm_line",
+            on_click=_check_latest_algorithm_line,
+        )
+
+    line_review = st.session_state.algorithm_line_review
+    if line_review:
+        if "error" in line_review:
+            if line_review["error"] == AI_NOT_CONFIGURED:
+                st.warning(line_review["error"])
+            else:
+                st.error(line_review["error"])
+        elif line_review.get("result"):
+            result = line_review["result"]
+            if result["is_correct"]:
+                st.success(f"✅ Sahi line: `{line_review['line']}`")
+            else:
+                st.error(f"❌ Yeh line sahi nahi: {result['feedback_roman_urdu']}")
+                st.markdown("**Sahi line:**")
+                st.code(result["correct_line"], language="text")
+            st.markdown(f"**Wajah:** {result['reason_roman_urdu']}")
         else:
-            st.session_state.ai_suggestion = None
-            st.warning(AI_NOT_CONFIGURED)
+            st.error("AI ka line review samajh nahi aya. Dobara koshish karein.")
 
     if st.session_state.ai_suggestion:
-        st.info(
-            "💡 **AI suggestion** — paste-ready pseudocode:\n\n"
-            f"```\n{st.session_state.ai_suggestion}\n```"
-        )
-        if st.button(
-            "📋 Copy to Editor",
-            key="copy_ai_suggestion",
-            use_container_width=True,
-            on_click=_copy_ai_suggestion_to_editor,
-        ):
-            st.rerun()
+        suggestion = st.session_state.ai_suggestion
+        if suggestion["is_complete"]:
+            st.success("🎉 AI ke mutabiq algorithm mukammal hai.")
+        else:
+            st.info(
+                f"💡 **Agli line:** `{suggestion['next_line']}`\n\n"
+                f"**Wajah:** {suggestion['reason_roman_urdu']}"
+            )
+            st.button(
+                "📋 Add suggested line",
+                key="copy_ai_suggestion",
+                on_click=_copy_ai_suggestion_to_editor,
+            )
 
     render_ai_validation(2)
 
