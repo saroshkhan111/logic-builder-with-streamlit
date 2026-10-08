@@ -48,7 +48,7 @@ def ask_ai(system: str, user: str) -> str | None:
     if not key:
         try:
             key = str(st.secrets.get("GROQ_API_KEY", "")).strip()
-        except (FileNotFoundError, KeyError, AttributeError):
+        except (AttributeError, FileNotFoundError, TypeError, KeyError):
             key = ""
     if not key or Groq is None:
         return None
